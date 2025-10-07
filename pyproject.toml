@@ -1,0 +1,57 @@
+[build-system]
+requires = ["scikit-build-core", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "discodj"
+version = "0.0.2"
+description = "DIfferentiable Simulations for COsmology - Done with Jax. An ND LSS cosmology N-body/LPT/ML/analysis package"
+readme = "README.md"
+license = "MIT"
+
+authors = [
+    { name = "Florian List", email = "florian.list@univie.ac.at" },
+    { name = "Oliver Hahn", email = "oliver.hahn@univie.ac.at" },
+    { name = "Lukas Winkler", email = "l.winkler@univie.ac.at" },
+    { name = "Thomas Floess", email = "thomas.floess@univie.ac.at" }
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+requires-python = ">=3.10"
+
+dependencies = [
+    "jax",
+    "einops",
+    "diffrax",
+]
+
+[project.optional-dependencies]
+gadget = ["pylians", "tqdm"]
+wavelets = ["pywavelets"]
+hdf5 = ["h5py"]
+docs = ["sphinx", "furo", "myst-nb", "tqdm"]
+all = ["pylians", "tqdm", "pywavelets", "h5py"]
+
+[project.urls]
+Homepage = "https://github.com/cosmo-sims/DISCO-DJ/"
+Issues = "https://github.com/cosmo-sims/DISCO-DJ/issues"
+
+[project.scripts]
+discodj_demo = "discodj_demo.discodj_demo:main"
+
+#[tool.scikit-build]
+#build.verbose = true
+#logging.level = "INFO"
+
+
+[tool.scikit-build.wheel.packages]
+"discodj" = "src/discodj"
+"discodj_native" = "src/discodj_native"
+"discodj_demo" = "src/discodj_demo"
+
