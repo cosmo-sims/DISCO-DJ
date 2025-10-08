@@ -118,11 +118,36 @@ pip install -e . --config-settings editable_mode=strict
 
 ##### - `CMAKE_CXX_COMPILER not set` or `Could NOT find GSL`
 
-DISCO-DJ requires a C++ compiler and GSL to compile some parts of it (NGENIC ICs and Tree-PM). On a Ubuntu/Debian this should be enough to install:
+DISCO-DJ requires a C++ compiler and GSL to compile some parts of it (N-GenIC ICs and Tree-PM). On a Ubuntu/Debian this should be enough to install:
 
 ```bash
 sudo apt install build-essential libgsl-dev libpython3-dev
 ```
+
+### Reference:
+
+This repository accompanies the paper
+
+* List, F., Hahn, O., Flöss, T., Winkler, L., *DISCO-DJ II: a differentiable particle-mesh code for cosmology*, Preprint [arXiv:2510.05206](https://arxiv.org/abs/2510.05206)
+
+If you use this code for a publication, please cite the paper as described below.
+
+```bibtex
+@article{DiscoDJ2,
+  author  = {Florian List and Oliver Hahn and Thomas Fl{\"o}ss and Lukas Winkler},
+  title   = {{DISCO-DJ II: a differentiable particle-mesh code for cosmology}},
+  journal = {Preprint},
+  year    = {2025},
+  eprint  = {2510.05206},
+  archivePrefix = {arXiv},
+  primaryClass  = {astro-ph.CO},
+  doi     = {10.48550/arXiv.2510.05206},
+  url     = {https://arxiv.org/abs/2510.05206}
+}
+```
+
+* If you use the Disco-DJ Einstein-Boltzmann solver hosted at https://github.com/ohahn/DISCO-EB, please also cite the DISCO-DJ I paper https://arxiv.org/abs/2311.03291 as specified in that Github repository.
+* If you use the BullFrog time integrator (default), please also cite https://arxiv.org/abs/2409.19049 and https://arxiv.org/abs/2301.09655.
 
 ### List of papers that use Disco-DJ
   *  List, F. and Hahn, O., *Perturbation-theory informed integrators for cosmological simulations*, JCP 113201, 2024, [arXiv:2301.09655](https://arxiv.org/abs/2301.09655)
