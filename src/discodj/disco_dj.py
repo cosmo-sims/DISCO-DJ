@@ -118,7 +118,12 @@ class DiscoDJ:
         # Potential children: cosmology & white noise field
         # Initialize the cosmology
         cosmo_args = {"dtype_num": self.dtype_num, "requires_jacfwd": requires_jacfwd}
-        make_jnp_array = lambda c: jax.tree_util.tree_map(lambda x: jnp.asarray(x, dtype=self.dtype), c)
+
+        def to_jax_array(input):
+            if isinstance(input, jax.core.Tracer):
+                return input
+            return jnp.asarray(input, dtype=self.dtype)
+        make_jnp_array = lambda c: jax.tree_util.tree_map(to_jax_array, c)
         if isinstance(cosmo, dict):
             cosmo_dict = make_jnp_array(cosmo)
             self._cosmo = Cosmology(**cosmo_dict, **cosmo_args)
