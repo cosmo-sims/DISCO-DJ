@@ -483,25 +483,27 @@ time. **The scene file records the chosen transfer function** so
 ## 9. Performance and memory at scale
 
 Observed on a 128 GB Apple-Silicon Mac, 18 physical cores, 2-LPT,
-n_part_chunks chosen to stay comfortable in RAM:
+n_part_chunks chosen to stay comfortable in RAM. The incremental-HDF5
+writer interleaves the radial kernel with the HDF5 append, so the
+"streaming + HDF5" row reports the combined wall time:
 
-| N | 2LPT compute | streaming kernel | HDF5 write | total |
+| N | n_part_chunks | 2LPT compute | streaming + HDF5 | total |
 |---|---|---|---|---|
-| 128³ | 0.5 s | 1.5 s | <1 s | ~3 s |
-| 256³ | 3 s | 11 s | 2 s | ~17 s |
-| 512³ | 6 s | 108 s | 22 s | **~140 s** |
-| 1024³ | ~4–5 min | ~15 min | ~2 min | **~25 min** |
+| 128³ | 2 | 0.5 s | ~2 s | ~3 s |
+| 256³ | 8 | 3 s | ~13 s | ~17 s |
+| 512³ | 8 | 6 s | ~130 s | **~140 s** |
+| 1024³ | 16 | 340 s | 1953 s | **38 min** |
 
 (N=1024 is the practical ceiling on 128 GB — both 2-LPT working memory
-and the catalogue grow as N³.)
+and the catalogue grow as N³; peak RSS during the 1024³ run was 32 GB.)
 
-Catalogue sizes (radial-velocity layout, Blosc-zstd compression):
+Catalogue sizes (radial-velocity layout, Blosc-zstd compression, observed):
 
-| N | crossings | raw catalogue | compressed |
+| N | crossings | raw catalogue | compressed file |
 |---|---|---|---|
 | 256³ | 0.14 G | 4 GB | 1.8 GB |
 | 512³ | 1.13 G | 32 GB | 13–15 GB |
-| 1024³ | ~9 G | ~250 GB | ~115 GB |
+| 1024³ | **9.02 G** | 252 GB | **113.8 GB** |
 
 ---
 
