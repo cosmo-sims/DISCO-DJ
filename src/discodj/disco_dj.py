@@ -834,6 +834,154 @@ class DiscoDJ:
         return self._evaluate_lpt_property_at_a(a=a, n_order=n_order, include_psi_0=False,
                                                 time_derivative=True, exact_growth=exact_growth)
 
+    def evaluate_lpt_lightcone(self, a_far: float, a_near: float = 1.0, n_shells: int = 64,
+                                observer: Array | None = None, n_order: int | None = None,
+                                exact_growth: bool = False, streaming: bool = False,
+                                n_part_chunks: int = 1, n_newton_iters: int = 0,
+                                keep_particle_idx: bool = False,
+                                radial_sort: bool = False,
+                                radial_residual_tol: float = 1e-1,
+                                v_mode: str = "radial",
+                                verbose: bool = False) -> dict:
+        """Generate past-lightcone particle records from the LPT trajectory.
+
+        For each shell interval in [a_far, a_near] and each periodic-box replica that
+        intersects the active lightcone, this finds the per-particle scale factor
+        a_cross where |x_LPT(a) - observer| = chi(a) and returns the position/velocity
+        at that crossing.
+
+        Two execution modes:
+
+        - ``streaming=False`` (default): vmap over all (shell, replica) pairs at once.
+          Output is a fixed-shape masked JAX dict; gradients flow through. Peak memory
+          O(S * R * N_part * 8 floats).
+
+        - ``streaming=True``: Python loop over shells with a jitted per-shell kernel
+          and per-shell host-side filtering. Returns numpy arrays already filtered
+          (mask field is omitted; all rows are physical crossings). With
+          ``n_part_chunks > 1``, switches to particle-major iteration with chunked
+          LPT evaluation, so the full ``(N, 3)`` position/velocity arrays are
+          never materialised — needed for billion-particle problems.
+          *Not* differentiable.
+
+        :param a_far: scale factor at the far edge of the lightcone (higher z).
+        :param a_near: scale factor at the near edge (default 1.0).
+        :param n_shells: number of log-spaced scale-factor bins between a_far and a_near.
+        :param observer: (3,) observer position in box coords (Mpc/h). Default: box centre.
+        :param n_order: LPT order (default: highest computed via with_lpt / compute_lpt).
+        :param exact_growth: forwarded to the LPT evaluator.
+        :param streaming: see above.
+        :param n_part_chunks: number of sequential particle-axis chunks (streaming only).
+            1 (default): shell-major fast path with full-N sliding window. >1: particle-major
+            with chunked LPT evaluation; needed when the full (N, 3) arrays don't fit.
+        :param n_newton_iters: streaming only, requires n_part_chunks > 1. Number of Newton
+            iterations on f(a) = |x_LPT(a) - x_obs| - chi(a) after the secant seed. 0 (default)
+            = secant only. >= 1 = refine to ~ulp precision; needed for AHK phase-space sheet
+            reconstruction where neighbouring particles' (x, v) consistency matters.
+        :param keep_particle_idx: streaming only. Include the per-row Lagrangian particle index
+            in the output (adds 4 B/record). Default False; set True for AHK sheet reconstruction.
+        :param verbose: in streaming mode, print per-shell / per-chunk progress.
+        :return: dict with 'x', 'v', 'a_cross', 'mask', 'replica_idx', 'shell_idx'.
+        """
+        if streaming and radial_sort:
+            if exact_growth:
+                raise NotImplementedError(
+                    "radial_sort does not yet support exact_growth=True; "
+                    "use radial_sort=False to fall back to the shell-loop path."
+                )
+            from .lpt.lightcone import evaluate_lpt_lightcone_streaming_radial
+            return evaluate_lpt_lightcone_streaming_radial(
+                self, a_far=a_far, a_near=a_near, n_shells=n_shells,
+                observer=observer, n_order=n_order,
+                n_part_chunks=n_part_chunks, n_newton_iters=n_newton_iters,
+                keep_particle_idx=keep_particle_idx,
+                residual_tol=radial_residual_tol,
+                v_mode=v_mode,
+                verbose=verbose,
+            )
+        if streaming:
+            from .lpt.lightcone import evaluate_lpt_lightcone_streaming
+            return evaluate_lpt_lightcone_streaming(
+                self, a_far=a_far, a_near=a_near, n_shells=n_shells,
+                observer=observer, n_order=n_order, exact_growth=exact_growth,
+                n_part_chunks=n_part_chunks, n_newton_iters=n_newton_iters,
+                keep_particle_idx=keep_particle_idx,
+                verbose=verbose,
+            )
+        from .lpt.lightcone import evaluate_lpt_lightcone
+        return evaluate_lpt_lightcone(self, a_far=a_far, a_near=a_near, n_shells=n_shells,
+                                      observer=observer, n_order=n_order, exact_growth=exact_growth)
+
+    def save_lpt_scene(self, path: str, *,
+                       include_psi: bool = True,
+                       include_fphi: bool = True,
+                       ic_params: dict | None = None,
+                       transfer_function: str = "Eisenstein-Hu",
+                       compression="zstd",
+                       storage_chunk_rows: int = 1 << 20) -> None:
+        """Persist the LPT scene (ψ fields + IC seed + cosmology) to HDF5.
+
+        Required for ``refresh_lightcone_cosmology(...)``. Pass
+        ``ic_params`` with the same kwargs you used in ``with_ics(...)`` so
+        the ``mode='exact'`` refresh path can reproduce the white noise
+        bit-for-bit.
+        """
+        from .lpt.lightcone_refresh import save_lpt_scene as _save
+        return _save(self, path,
+                     include_psi=include_psi, include_fphi=include_fphi,
+                     ic_params=ic_params,
+                     transfer_function=transfer_function,
+                     compression=compression,
+                     storage_chunk_rows=storage_chunk_rows)
+
+    @staticmethod
+    def refresh_lightcone_cosmology(scene_path: str,
+                                     input_lightcone: str,
+                                     output_lightcone: str,
+                                     new_cosmology,
+                                     **kwargs) -> dict:
+        """File-to-file lightcone refresh at a new cosmology. See
+        ``discodj.lpt.lightcone_refresh.refresh_lightcone_cosmology`` for
+        keyword arguments."""
+        from .lpt.lightcone_refresh import refresh_lightcone_cosmology as _refresh
+        return _refresh(scene_path, input_lightcone, output_lightcone,
+                        new_cosmology, **kwargs)
+
+    def evaluate_lpt_lightcone_to_hdf5(self, output_path: str, a_far: float,
+                                        a_near: float = 1.0, n_shells: int = 64,
+                                        observer: Array | None = None,
+                                        n_order: int | None = None,
+                                        n_part_chunks: int = 1,
+                                        n_newton_iters: int = 1,
+                                        keep_particle_idx: bool = False,
+                                        radial_residual_tol: float = 1e-1,
+                                        v_mode: str = "radial",
+                                        compression="zstd",
+                                        storage_chunk_rows: int = 1 << 20,
+                                        verbose: bool = False) -> dict:
+        """Generate a radial-sort lightcone and write directly to HDF5.
+
+        Per-chunk crossings are appended to extendable HDF5 datasets as they
+        are computed, so peak memory holds at most one chunk's worth of
+        crossings — not the full catalogue. Use this when the catalogue would
+        not fit in RAM (N >= 768 on a 128 GB host).
+
+        :return: ``{"n_particles": int, "n_replicas": int}`` summary.
+        """
+        from .lpt.lightcone import evaluate_lpt_lightcone_to_hdf5_radial
+        return evaluate_lpt_lightcone_to_hdf5_radial(
+            self, output_path,
+            a_far=a_far, a_near=a_near, n_shells=n_shells,
+            observer=observer, n_order=n_order,
+            n_part_chunks=n_part_chunks, n_newton_iters=n_newton_iters,
+            keep_particle_idx=keep_particle_idx,
+            residual_tol=radial_residual_tol,
+            v_mode=v_mode,
+            compression=compression,
+            storage_chunk_rows=storage_chunk_rows,
+            verbose=verbose,
+        )
+
     # Eulerian acceleration via Vlasov-Poisson equation
     def evaluate_lpt_eulerian_acc_at_a(self, a: Array | float, n_order: int | None = None) -> Array:
         """Evaluate the Eulerian acceleration field at the given scale factor and LPT order.
