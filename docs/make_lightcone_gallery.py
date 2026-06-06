@@ -36,17 +36,24 @@ FIGDIR = os.path.join(HERE, "figures")
 os.makedirs(FIGDIR, exist_ok=True)
 
 # ---- simulation / survey configuration (kept modest so this runs in minutes) ----
-RES = 128
+RES = int(os.environ.get("GALLERY_RES", "128"))
 BOXSIZE = 1500.0           # Mpc/h
 A_FAR, A_NEAR = 0.5, 1.0   # z = 1 -> z = 0
 N_SHELLS = 32
-NSIDE = 64
+NSIDE = int(os.environ.get("GALLERY_NSIDE", "256"))  # HEALPix map resolution
+NSIDE_GAL = 128            # galaxy angular map (sparser tracer)
+SMOOTH_DEG = 0.7           # map smoothing FWHM
 Z_SOURCE = 1.0             # weak-lensing source plane at the far edge
 C_KM_S = 299792.458
 # Phase-space-sheet over-sampling: n_resample^3 sub-particles per Lagrangian
 # cell (each 1/n^3 of the mass), sampled inside the cell by Fourier-interpolating
 # psi -> smooth fixed-mass-per-tetrahedron deposit instead of grid-vertex aliasing.
-N_RESAMPLE = int(os.environ.get("GALLERY_NRESAMPLE", "3"))
+N_RESAMPLE = int(os.environ.get("GALLERY_NRESAMPLE", "2"))
+# Galaxies = the densest phase-space-sheet elements: the top GAL_PERCENT %
+# of sub-particles by stream density 1/|det T| (the local sheet density). This
+# traces the collapsed knots/filaments and gives a tunable galaxy number
+# density — a sheet-density-selected mock galaxy field.
+GAL_PERCENT = float(os.environ.get("GALLERY_GAL_PERCENT", "3.0"))
 
 plt.rcParams.update({
     "figure.facecolor": "#0d1117", "savefig.facecolor": "#0d1117",
@@ -68,11 +75,12 @@ def generate_lightcone(path):
                    a_edges=np.geomspace(A_FAR, A_NEAR, N_SHELLS + 1),
                    weighted=True)
     print(f"Generating lightcone (+ shell maps), n_resample={N_RESAMPLE} "
-          f"-> {N_RESAMPLE**3} sub-particles/cell ...", flush=True)
+          f"-> {N_RESAMPLE**3} sub-particles/cell, nside={NSIDE} ...", flush=True)
     summary = dj.evaluate_lpt_lightcone_to_hdf5(
         path, a_far=A_FAR, a_near=A_NEAR, n_shells=N_SHELLS, observer=observer,
         n_part_chunks=4, n_newton_iters=1, v_mode="radial",
-        n_resample=N_RESAMPLE, map_spec=spec, verbose=True)
+        n_resample=N_RESAMPLE, deformation_mode="stream",
+        map_spec=spec, verbose=True)
     print(f"  -> {summary['n_particles']:,} crossings, "
           f"{summary['n_replicas']} replicas", flush=True)
     return dj, observer, spec, summary
@@ -98,7 +106,7 @@ def fig_sky_density(spec, density_shells, out):
     slab = (z_mid >= 0.2) & (z_mid <= 0.5)
     m = np.asarray(density_shells)[slab].sum(axis=0)
     ratio = m / max(m[m > 0].mean(), 1e-30)            # 1 + delta
-    sm = hp.smoothing(ratio, fwhm=np.radians(1.5))
+    sm = hp.smoothing(ratio, fwhm=np.radians(SMOOTH_DEG))
     plt.close("all")
     hp.mollview(np.log10(np.clip(sm, 1e-2, None)), cmap="magma", cbar=True,
                 norm="hist",
@@ -113,7 +121,7 @@ def fig_convergence(dj, spec, density_shells, out):
     delta = shells_to_overdensity(density_shells)
     kappa = np.asarray(density_shells_to_kappa(delta, spec.a_edges, dj.cosmo,
                                                z_source=Z_SOURCE))
-    kappa = hp.smoothing(kappa, fwhm=np.radians(1.5))
+    kappa = hp.smoothing(kappa, fwhm=np.radians(SMOOTH_DEG))
     lim = np.percentile(np.abs(kappa), 99)
     plt.close("all")
     hp.mollview(kappa, cmap="RdBu_r", cbar=True, min=-lim, max=lim,
@@ -123,21 +131,41 @@ def fig_convergence(dj, spec, density_shells, out):
     _save_mollview(out)
 
 
-def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
-    """Stream the catalogue once, gathering: a thin-Dec wedge slice, the n(z)
-    histograms, and a random 3-D subsample. Returns a dict of arrays."""
+def _stream_density_threshold(path, percent, stride_rows=37):
+    """Top-`percent` stream-density cut, estimated from a strided subsample."""
     import h5py
+    with h5py.File(path, "r") as f:
+        g = f["PartType1"]
+        if "StreamDensity" not in g:
+            return None
+        sd = np.asarray(g["StreamDensity"][::stride_rows], dtype=np.float64)
+    return float(np.percentile(sd, 100.0 - percent))
+
+
+def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
+    """Stream the catalogue once, gathering: the thin-Dec wedge slice (all mass
+    + galaxies), the n(z) histograms, a 3-D subsample, and a galaxy HEALPix
+    count map. Galaxies are the densest phase-space-sheet elements — the top
+    GAL_PERCENT % by stream density 1/|det T| (collapsed knots/filaments).
+    Returns a dict of arrays."""
+    import h5py
+    from discodj.core.healpix import ang2pix_ring, nside2npix
     obs = np.asarray(observer)
     a_obs_of_z = lambda z: 1.0 / (1.0 + z)
+    gal_thresh = _stream_density_threshold(path, GAL_PERCENT)
 
     wedge = {k: [] for k in ("ra", "chi_real", "chi_rsd")}
-    z_real_all, z_rsd_all = [], []
+    gwedge = {k: [] for k in ("ra", "chi_real")}     # galaxies in the slice
+    z_real_all, z_rsd_all, zg_all = [], [], []
     sub = {k: [] for k in ("x", "y", "z", "redshift")}
+    gal_map = np.zeros(nside2npix(NSIDE_GAL), dtype=np.float64)
+    n_tot = n_gal = 0
     batch = 1 << 22
     with h5py.File(path, "r") as f:
         g = f["PartType1"]
         M = g["Coordinates"].shape[0]
         stride = max(M // n_3d, 1)
+        has_sd = "StreamDensity" in g and gal_thresh is not None
         for s in range(0, M, batch):
             e = min(s + batch, M)
             x = np.asarray(g["Coordinates"][s:e], dtype=np.float64)
@@ -153,7 +181,20 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
             z_obs = (1.0 + z_cosmo) * (1.0 + v_pec / C_KM_S) - 1.0
             z_real_all.append(z_cosmo)
             z_rsd_all.append(z_obs)
-            # thin equatorial slice for the wedge
+            n_tot += e - s
+            # galaxies = densest sheet elements (top GAL_PERCENT % stream density)
+            if has_sd:
+                sd = np.asarray(g["StreamDensity"][s:e], dtype=np.float64)
+                is_gal = sd > gal_thresh
+            else:
+                is_gal = np.zeros(e - s, dtype=bool)
+            n_gal += int(is_gal.sum())
+            if is_gal.any():
+                gp = ang2pix_ring(NSIDE_GAL, jnp.asarray(theta[is_gal]),
+                                  jnp.asarray(phi[is_gal]))
+                np.add.at(gal_map, np.asarray(gp), 1.0)
+                zg_all.append(z_cosmo[is_gal])
+            # thin equatorial slice for the wedge (all mass + galaxies)
             sl = np.abs(dec) < dec_halfwidth
             if sl.any():
                 a_obs = a_obs_of_z(z_obs[sl])
@@ -161,6 +202,10 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
                 wedge["ra"].append(np.radians(ra[sl]))
                 wedge["chi_real"].append(d[sl])
                 wedge["chi_rsd"].append(chi_rsd)
+                slg = sl & is_gal
+                if slg.any():
+                    gwedge["ra"].append(np.radians(ra[slg]))
+                    gwedge["chi_real"].append(d[slg])
             # 3-D subsample (strided)
             idx = np.arange(0, e - s, stride)
             if idx.size:
@@ -168,8 +213,13 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
                 sub["z"].append(rel[idx, 2]); sub["redshift"].append(z_cosmo[idx])
     cat = {k: (np.concatenate(v) if v else np.zeros(0))
            for d_ in (wedge, sub) for k, v in d_.items()}
+    cat["gal_ra"] = np.concatenate(gwedge["ra"]) if gwedge["ra"] else np.zeros(0)
+    cat["gal_chi"] = np.concatenate(gwedge["chi_real"]) if gwedge["chi_real"] else np.zeros(0)
     cat["z_real"] = np.concatenate(z_real_all)
     cat["z_rsd"] = np.concatenate(z_rsd_all)
+    cat["z_gal"] = np.concatenate(zg_all) if zg_all else np.zeros(0)
+    cat["gal_map"] = gal_map
+    cat["gal_frac"] = n_gal / max(n_tot, 1)
     return cat
 
 
@@ -241,17 +291,67 @@ def fig_rsd(cat, out):
     print(f"  wrote {out}", flush=True)
 
 
+def fig_galaxy_sky(cat, out):
+    """Angular clustering of the sheet-selected galaxies (smoothed HEALPix)."""
+    gmap = hp.smoothing(cat["gal_map"], fwhm=np.radians(1.0))
+    plt.close("all")
+    hp.mollview(gmap, cmap="cividis", cbar=True, norm="hist",
+                title=f"Galaxy angular density (top {GAL_PERCENT:g}% densest "
+                      f"sheet elements)",
+                unit="galaxies / pixel (smoothed)", bgcolor="#0d1117")
+    hp.graticule(color="#30363d", dpar=30, dmer=30)
+    _save_mollview(out)
+
+
+def fig_galaxies_web(cat, out):
+    """Galaxies (cyan) over the dark-matter density slice (Cartesian, no polar
+    ring artifacts) — they trace the knots and filaments, biased."""
+    ra, chi = cat["ra"], cat["chi_real"]
+    x = chi * np.cos(ra); y = chi * np.sin(ra)
+    R = chi.max() * 1.02
+    nb = 460
+    w = 1.0 / np.clip(chi, 1.0, None)
+    H, _, _ = np.histogram2d(x, y, bins=nb, range=[[-R, R], [-R, R]], weights=w)
+    H = H.T
+    pos = H[H > 0]
+    img = np.log10(np.where(H > 0, H, pos.min() * 0.5))
+    gx = cat["gal_chi"] * np.cos(cat["gal_ra"])
+    gy = cat["gal_chi"] * np.sin(cat["gal_ra"])
+    plt.close("all")
+    fig, ax = plt.subplots(figsize=(8.8, 8.8))
+    ax.set_facecolor("#05070a")
+    ax.imshow(img, origin="lower", extent=[-R, R, -R, R], cmap="bone",
+              interpolation="bilinear",
+              vmin=np.percentile(np.log10(pos), 45),
+              vmax=np.percentile(np.log10(pos), 99))
+    ax.scatter(gx, gy, s=0.3, c="#39d0d8", alpha=0.5, linewidths=0)
+    ax.set_aspect("equal")
+    ax.set_xlabel("comoving x [Mpc/h]"); ax.set_ylabel("comoving y [Mpc/h]")
+    ax.set_title("Galaxies (cyan) tracing the cosmic web over the smooth "
+                 "dark-matter density\n"
+                 f"(top {GAL_PERCENT:g}% densest sheet elements = "
+                 f"{cat['gal_frac']*100:.1f}% of the mass)", pad=14)
+    plt.savefig(out, dpi=140, bbox_inches="tight")
+    plt.close("all")
+    print(f"  wrote {out}", flush=True)
+
+
 def fig_nz(cat, out):
-    """Redshift distribution, cosmological vs observed (RSD)."""
+    """Redshift distribution, cosmological vs observed (RSD) + galaxies."""
     fig, ax = plt.subplots(figsize=(9, 4.6))
     bins = np.linspace(0, 1.0, 60)
     ax.hist(cat["z_real"], bins=bins, histtype="step", color="#58a6ff",
-            lw=2, label="cosmological redshift")
+            lw=2, label="all mass (cosmological z)")
     ax.hist(cat["z_rsd"], bins=bins, histtype="step", color="#f0883e",
-            lw=2, label="observed redshift (with RSD)")
+            lw=2, label="all mass (observed z, RSD)")
+    if cat["z_gal"].size:
+        scale = cat["z_real"].size / max(cat["z_gal"].size, 1)
+        ax.hist(cat["z_gal"], bins=bins, histtype="step", color="#39d0d8",
+                lw=2, weights=np.full(cat["z_gal"].size, scale),
+                label="galaxies (collapsed sheet, rescaled)")
     ax.set_xlabel("redshift $z$"); ax.set_ylabel("crossings / bin")
     ax.set_title("Lightcone redshift distribution $n(z)$")
-    ax.legend(frameon=False)
+    ax.legend(frameon=False, fontsize=9)
     ax.grid(color="#30363d", alpha=0.3)
     plt.savefig(out, dpi=140, bbox_inches="tight")
     plt.close("all")
@@ -340,11 +440,19 @@ def build_html(figs, plotly_div, summary, out):
     {cards[0]}
     {cards[1]}
   </div>
-  <h2 class="section">The cosmic web &amp; catalogues</h2>
+  <h2 class="section">The cosmic web</h2>
   <div class="grid">
     <div class="wide">{cards[2]}</div>
+  </div>
+  <h2 class="section">Galaxies from the phase-space sheet</h2>
+  <div class="grid">
     <div class="wide">{cards[3]}</div>
     {cards[4]}
+  </div>
+  <h2 class="section">Redshift-space &amp; n(z)</h2>
+  <div class="grid">
+    <div class="wide">{cards[5]}</div>
+    {cards[6]}
   </div>
   <h2 class="section">Interactive</h2>
   <div class="interactive">{plotly_div}</div>
@@ -387,14 +495,19 @@ def main():
     p_web = os.path.join(FIGDIR, "cosmic_web_wedge.png")
     p_rsd = os.path.join(FIGDIR, "rsd_comparison.png")
     p_nz = os.path.join(FIGDIR, "nz_distribution.png")
+    p_gsky = os.path.join(FIGDIR, "galaxy_sky.png")
+    p_gweb = os.path.join(FIGDIR, "galaxies_web.png")
 
-    print("Rendering smooth-field maps ...", flush=True)
+    print(f"Rendering smooth-field maps (nside={NSIDE}) ...", flush=True)
     fig_sky_density(spec, density_shells, p_density)
     fig_convergence(dj, spec, density_shells, p_kappa)
 
-    print("Reading catalogue for the wedge / RSD / n(z) / 3-D ...", flush=True)
+    print("Reading catalogue for the web / RSD / n(z) / galaxies / 3-D ...",
+          flush=True)
     cat = read_catalogue(tmp, observer, dj)
     fig_cosmic_web(cat, p_web)
+    fig_galaxy_sky(cat, p_gsky)
+    fig_galaxies_web(cat, p_gweb)
     fig_rsd(cat, p_rsd)
     fig_nz(cat, p_nz)
 
@@ -402,8 +515,10 @@ def main():
     plotly_div = interactive_3d_html(cat)
     figs = [
         ("Projected dark-matter density",
-         "Mass painted onto a HEALPix sky, summed over the lightcone shells — "
-         "the smooth large-scale-structure field a survey integrates through.",
+         f"Mass painted onto a HEALPix sky (nside={NSIDE}) from the lightcone "
+         "shells — the smooth large-scale-structure field a survey integrates "
+         "through. Deposited with phase-space-sheet over-sampling, so it is the "
+         "correct fixed-mass-per-tetrahedron density, not a grid of points.",
          p_density),
         ("Weak-lensing convergence &kappa;",
          "Born-approximation convergence from the overdensity shells. Fully "
@@ -415,14 +530,24 @@ def main():
          "mass <em>inside</em> each Lagrangian cell, so there is no grid-vertex "
          "aliasing.",
          p_web),
+        ("Galaxies from the phase-space sheet",
+         f"Galaxies are the densest sheet elements — the top {GAL_PERCENT:g}% by "
+         "stream density 1/|det&nbsp;T| (the collapsed knots and filaments). They "
+         "cluster strongly, biased relative to the smooth mass: a mock galaxy "
+         "field straight from the sheet's local density.",
+         p_gweb),
+        ("Galaxy angular clustering",
+         "The same sheet-selected galaxies on the sky — the angular galaxy "
+         "density a survey would measure.",
+         p_gsky),
         ("Redshift-space distortions",
          "The same structures in real space vs redshift space: peculiar "
          "velocities (from the stored radial velocity) stretch them along the "
          "line of sight — the signal RSD analyses target.",
          p_rsd),
         ("Redshift distribution n(z)",
-         "Cosmological vs observed redshifts over the full catalogue; the RSD "
-         "shift redistributes counts between bins.",
+         "Cosmological vs observed (RSD) redshifts for all mass, plus the "
+         "sheet-selected galaxies (rescaled) — the galaxy n(z) a survey sees.",
          p_nz),
     ]
     out_html = os.path.join(HERE, "lightcone_gallery.html")

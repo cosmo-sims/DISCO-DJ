@@ -99,6 +99,29 @@ def test_sheet_resampling_conserves_mass(tmp_path):
     assert read_lightcone_header(str(tmp_path / "nr3.h5"))["NumResample"] == 3
 
 
+def test_maps_only_skips_catalogue(tmp_path):
+    """write_catalogue=False accumulates the shell maps but writes no PartType1
+    rows — letting high n_resample populate fine maps without a huge file."""
+    import h5py
+    dj = _make_dj()
+    observer = np.array([256.0, 256.0, 256.0])
+    spec = MapSpec(nside=8, a_edges=np.geomspace(0.4, 1.0, 9), weighted=True)
+    kw = dict(a_far=0.4, a_near=1.0, n_shells=16, observer=observer,
+              n_part_chunks=2, n_newton_iters=1, v_mode="radial",
+              n_resample=2, map_spec=spec)
+    full = dj.evaluate_lpt_lightcone_to_hdf5(str(tmp_path / "full.h5"),
+                                             write_catalogue=True, **kw)
+    mo = dj.evaluate_lpt_lightcone_to_hdf5(str(tmp_path / "mo.h5"),
+                                           write_catalogue=False, **kw)
+    assert mo["n_particles"] == 0
+    with h5py.File(str(tmp_path / "mo.h5"), "r") as f:
+        assert f["PartType1/Coordinates"].shape[0] == 0
+        assert "Maps/ShellMaps" in f
+    # the maps are identical whether or not the catalogue is written
+    np.testing.assert_allclose(np.asarray(mo["maps"]),
+                               np.asarray(full["maps"]), rtol=1e-5)
+
+
 def test_on_the_fly_maps_match_posthoc(tmp_path):
     """Maps accumulated during HDF5 generation must match a post-hoc pass over
     the written catalogue."""

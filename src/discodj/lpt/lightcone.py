@@ -846,6 +846,7 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     v_mode: str = "radial",
     deformation_mode: str = "none",
     n_resample: int = 1,
+    write_catalogue: bool = True,
     compression="zstd",
     storage_chunk_rows: int = 1 << 20,
     map_spec=None,
@@ -882,6 +883,11 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
         the smooth fixed-mass-per-tetrahedron sheet field. Multiplies the row
         count (and runtime) by ``n_resample^dim``; the Header records
         ``NumResample``.
+    :param write_catalogue: if ``False``, the per-particle ``PartType1`` rows
+        are *not* written (datasets stay empty) — only the ``map_spec`` shell
+        maps are accumulated to ``/Maps``. Lets you crank ``n_resample`` for
+        smooth high-``nside`` maps without the disk / row cost of a billion-row
+        catalogue.
     :param storage_chunk_rows: HDF5 dataset chunk size (rows per compressed
         block). 1<<20 (1M particles) balances compression ratio against
         partial-read efficiency.
@@ -1109,9 +1115,10 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
                         if multi_obs:
                             extra_c["ObserverIndex"] = onp.full(
                                 x_c.shape[0], obs_idx, dtype=onp.int16)
-                        writer.append(x=x_c, v=v_c, a=a_c, replica_idx=rep_c,
-                                      shell_idx=shell_c, particle_idx=lpid_c,
-                                      extra=(extra_c or None))
+                        if write_catalogue:
+                            writer.append(x=x_c, v=v_c, a=a_c, replica_idx=rep_c,
+                                          shell_idx=shell_c, particle_idx=lpid_c,
+                                          extra=(extra_c or None))
                         if map_spec is not None:
                             from .lightcone_maps import accumulate_shell_maps
                             mw = (onp.full(x_c.shape[0], particle_mass, dtype=onp.float32)

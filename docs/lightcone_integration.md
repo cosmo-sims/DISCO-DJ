@@ -26,29 +26,42 @@ across cosmologies for Fisher / inference work.
 **▶ Open the interactive gallery: [`lightcone_gallery.html`](lightcone_gallery.html)**
 (drag-to-rotate 3-D view + full-resolution figures).
 
-#### Smooth fields
+#### Smooth fields (nside = 256)
 
 | Projected DM density (z ≈ 0.2–0.5 slab) | Weak-lensing convergence κ (Born, z_s = 1) |
 |---|---|
 | ![Projected DM density](figures/sky_density.png) | ![Convergence map](figures/sky_convergence.png) |
 
-Mass painted onto a HEALPix sky from the lightcone shells, and the Born-approx
-convergence from the overdensity shells — both pure-JAX, so `∂C_ℓ/∂θ` flows
-straight back to cosmology.
+High-resolution HEALPix maps deposited from the over-sampled phase-space sheet
+(correct fixed-mass-per-tetrahedron density, not a grid of points), and the
+Born-approx convergence — both pure-JAX, so `∂C_ℓ/∂θ` flows straight back to
+cosmology.
 
-#### The cosmic web & catalogues
+#### The cosmic web
 
 ![Cosmic web slice](figures/cosmic_web_wedge.png)
 
 *A 4°-thick slice through the lightcone (observer at centre) — filaments, knots
-and voids straight from the 2-LPT particle catalogue.*
+and voids, smoothly deposited from the sheet (no grid aliasing).*
+
+#### Galaxies from the phase-space sheet
+
+| Galaxies tracing the web | Galaxy angular clustering |
+|---|---|
+| ![Galaxies on the web](figures/galaxies_web.png) | ![Galaxy sky map](figures/galaxy_sky.png) |
+
+Galaxies are the **densest sheet elements** — the top few % by stream density
+`1/|det T|` (the collapsed knots and filaments). They cluster strongly, biased
+relative to the smooth mass: a mock galaxy field straight from the sheet topology.
+
+#### Redshift-space & n(z)
 
 | Redshift-space distortions | Redshift distribution n(z) |
 |---|---|
 | ![RSD comparison](figures/rsd_comparison.png) | ![n(z)](figures/nz_distribution.png) |
 
 The same structures in real vs redshift space (peculiar velocities stretch them
-along the line of sight), and the cosmological-vs-observed redshift distribution.
+along the line of sight), and the n(z) for all mass plus the sheet galaxies.
 
 > Regenerate everything with `python docs/make_lightcone_gallery.py` (needs the
 > `discodj[sky]` extra plus `matplotlib healpy plotly`).
@@ -312,6 +325,10 @@ Key knobs:
   It multiplies the row count and runtime by `n_resample³`; use it for smooth
   *fields/maps* (`map_spec`), not when you only need the discrete catalogue.
   The Header records `NumResample`.
+- **`write_catalogue=False`** accumulates only the `map_spec` shell maps (to
+  `/Maps`) and writes **no** `PartType1` rows. Combine with a large `n_resample`
+  to populate smooth high-`nside` maps without paying the disk / row cost of a
+  billion-row catalogue.
 - **`compression='zstd'`** maps to multi-threaded Blosc-zstd (~3× faster
   than single-thread zstd at the same ratio). Alternatives:
   `'lz4'` (faster, larger), `'blosc2'` (Blosc2 instead of v1, slightly
