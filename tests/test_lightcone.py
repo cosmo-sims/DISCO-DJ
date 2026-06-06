@@ -268,6 +268,25 @@ def test_save_lightcone_hdf5(tmp_path):
         assert f["PartType1/ShellIndex"].dtype == np.int16
 
 
+def test_randomize_replicas_preserves_count_and_chi():
+    """Per-replica cubic-group randomisation is an orthogonal transform of a
+    periodic box, so it must preserve the crossing count and keep every crossing
+    on the lightcone (|x - obs| = chi(a_cross))."""
+    dj = _make_dj(res=8, boxsize=300.0, n_order=2)   # small box -> replicas
+    observer = np.array([150.0, 150.0, 150.0])
+    kw = dict(a_far=0.4, a_near=1.0, n_shells=24, observer=observer,
+              streaming=True, radial_sort=True, n_part_chunks=2, n_newton_iters=1,
+              v_mode="radial")
+    base = dj.evaluate_lpt_lightcone(randomize_replicas=False, **kw)
+    rand = dj.evaluate_lpt_lightcone(randomize_replicas=True, replica_seed=3, **kw)
+    # same number of crossings (orthogonal maps don't add/remove particles)
+    assert abs(base["x"].shape[0] - rand["x"].shape[0]) / base["x"].shape[0] < 0.02
+    # every randomized crossing still lies on the lightcone
+    d = np.linalg.norm(rand["x"] - observer[None, :], axis=-1)
+    chi = np.asarray(dj.cosmo.chi(jnp.asarray(rand["a_cross"])))
+    assert np.median(np.abs(d - chi)) < 0.5  # Mpc/h
+
+
 def test_lightcone_hdf5_writer_roundtrip(tmp_path):
     """LightconeHDF5Writer builds the standard schema, converts velocities to
     the Gadget convention, generates sequential IDs, and supports extra

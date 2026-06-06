@@ -17,12 +17,15 @@ that the observational-modeling pipeline will consume.
 ## 0. Gallery — one lightcone, many products
 
 Every panel below comes from a **single** differentiable 2-LPT past-lightcone
-(128³ particles, 1500 Mpc/h box, Planck18) generated and rendered by
-[`make_lightcone_gallery.py`](make_lightcone_gallery.py). Mass is deposited with
+(256³ particles, 4000 Mpc/h box, Planck18) generated and rendered by
+[`make_lightcone_gallery.py`](make_lightcone_gallery.py). Two choices make the
+fields homogeneous and artifact-free: (i) mass is deposited with
 **phase-space-sheet over-sampling** (`n_resample`: sub-particles sampled inside
-each Lagrangian cell, fixed mass per tetrahedron) so the fields are smooth and
-free of grid-vertex aliasing. The same pipeline scales to 1024³ and refreshes
-across cosmologies for Fisher / inference work.
+each Lagrangian cell, fixed mass per tetrahedron) so there is no grid-vertex
+aliasing; and (ii) the **box is larger than the lightcone** (`L > 2·χ_max`, so
+the whole past-light ball fits in one box, no periodic replication — see the
+replication note in §11). The same pipeline scales to 1024³ and refreshes across
+cosmologies for Fisher / inference work.
 **▶ Open the interactive gallery: [`lightcone_gallery.html`](lightcone_gallery.html)**
 (drag-to-rotate 3-D view + full-resolution figures).
 
@@ -715,6 +718,22 @@ cannot; `ShellIndex` is the bracket (step) index. Single observer; not autodiff.
 - **Velocities are Gadget √a-scaled.** Divide by √a to get peculiar
   velocity in km/s. The Gadget convention is preserved so existing tools
   (yt, swiftsimio, pynbody, …) can ingest the file directly.
+
+- **Periodic replication imprints the box geometry.** When `χ_max > L/2` the
+  lightcone tiles periodic copies of the *same* box, so identical structures
+  repeat every `L` — a cubic lattice of repeated superclusters (cubic
+  anisotropy), strongest when the observer sits at a lattice-symmetric point.
+  This is geometry, not a bug: the crossing count matches the comoving
+  ball-volume to ~4 significant figures. There is **no artifact-free way to
+  decorrelate replicas of a single periodic box** — any per-replica rotation or
+  translation breaks the seamless face-matching and leaves overdense seams at
+  the box faces (`evaluate_lpt_lightcone(..., randomize_replicas=True)` offers it
+  but with that caveat). The clean solution is a **box larger than the
+  lightcone** (`L > 2·χ_max` → a single box, no replication), which is what the
+  gallery uses. Independently, sample tracers **uniformly within each cell**
+  (`n_resample`, and a sub-cell offset for one-per-cell galaxies) — a lattice
+  sampled at its vertices is itself not homogeneous on the lightcone (radial
+  sphere-shell rings + cubic axis spokes).
 
 ---
 

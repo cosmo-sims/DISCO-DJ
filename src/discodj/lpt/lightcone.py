@@ -466,13 +466,24 @@ def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
     @partial(jax.jit, static_argnames=("chunk_size",))
     def kernel(start, chunk_size, r_offset, a_mid, a_far, a_near,
                observer, a_shells, residual_tol,
-               q_flat, psi_flats, grad_psi_flats=()):
+               q_flat, psi_flats, grad_psi_flats=(), rot=None, box_center=None):
         # Slice LPT data for this chunk
         q_chunk = jax.lax.dynamic_slice_in_dim(q_flat, start, chunk_size, axis=0)
         psi_chunks = tuple(
             jax.lax.dynamic_slice_in_dim(psi_n, start, chunk_size, axis=0)
             for psi_n in psi_flats
         )
+
+        # Optional per-replica randomisation: rotate/reflect this replica's box
+        # content about its centre by a cubic-group element ``rot`` (exact for a
+        # periodic box) to decorrelate the repeated copies — otherwise the tiled
+        # box imprints a cubic lattice of *identical* structures on a deep
+        # lightcone. Rotating (q, psi) is equivalent to rotating the trajectory:
+        #   x_box -> rot @ (x_box - centre) + centre.
+        if rot is not None:
+            rotT = rot.T.astype(dtype)
+            q_chunk = (q_chunk - box_center[None, :]) @ rotT + box_center[None, :]
+            psi_chunks = tuple(p @ rotT for p in psi_chunks)
 
         # 1. Midpoint LPT position and distance to observer
         D_mid = cosmo.Dplus(jnp.atleast_1d(a_mid)).astype(dtype)[0]
@@ -561,6 +572,12 @@ def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
                 jax.lax.dynamic_slice_in_dim(g, start, chunk_size, axis=0)
                 for g in grad_psi_flats
             )
+            if rot is not None:
+                # gradient transforms as grad' = R @ grad @ R^T
+                grad_chunks = tuple(
+                    jnp.einsum("ab,nbc,dc->nad", rot.astype(dtype), g,
+                               rot.astype(dtype))
+                    for g in grad_chunks)
             eye = jnp.broadcast_to(jnp.eye(3, dtype=dtype),
                                    (chunk_size, 3, 3))
             T = eye
@@ -669,6 +686,31 @@ def _sheet_shift_vectors(dim: int, n_resample: int) -> onp.ndarray:
     return onp.stack([g.reshape(-1) for g in grid], axis=-1)
 
 
+def _cubic_group_matrices() -> onp.ndarray:
+    """The 48 signed axis-permutation matrices (the cubic point group O_h).
+
+    These are exactly the orthogonal maps that send the periodic box to itself,
+    so rotating/reflecting a replica's content by one of them tiles space without
+    gaps or overlaps — the right way to decorrelate periodic replicas."""
+    import itertools
+    mats = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            M = onp.zeros((3, 3), dtype=onp.float64)
+            for i, p in enumerate(perm):
+                M[i, p] = signs[i]
+            mats.append(M)
+    return onp.asarray(mats)  # (48, 3, 3)
+
+
+def _replica_rotations(n_replicas: int, seed: int) -> onp.ndarray:
+    """One random cubic-group matrix per replica (deterministic given seed)."""
+    group = _cubic_group_matrices()
+    rng = onp.random.default_rng(seed)
+    idx = rng.integers(0, group.shape[0], size=n_replicas)
+    return group[idx]  # (n_replicas, 3, 3)
+
+
 # Extra-column schema emitted for each deformation_mode (name -> (shape_tail, dtype)).
 def _deformation_columns(deformation_mode: str):
     if deformation_mode == "stream":
@@ -688,6 +730,8 @@ def evaluate_lpt_lightcone_streaming_radial(
     residual_tol: float = 1e-1,  # Mpc/h
     v_mode: str = "radial",
     deformation_mode: str = "none",
+    randomize_replicas: bool = False,
+    replica_seed: int = 0,
     verbose: bool = False,
 ):
     """Radial-sort variant: solve each (particle, replica) for its single
@@ -743,6 +787,9 @@ def evaluate_lpt_lightcone_streaming_radial(
     if R == 0:
         return _empty_streaming_result(keep_particle_idx, v_is_radial=v_is_radial)
     replica_offsets = jnp.asarray(replicas, dtype=dtype) * boxsize  # (R, 3)
+    # Per-replica cubic-group rotation to decorrelate the periodic copies.
+    box_center_d = jnp.asarray([boxsize / 2] * 3, dtype=dtype) if randomize_replicas else None
+    rot_mats = (_replica_rotations(R, replica_seed) if randomize_replicas else None)
     observer_jax = jnp.asarray(observer_host, dtype=dtype)
     a_shells_d = jnp.asarray(a_shells_host, dtype=dtype)
     a_far_d = jnp.asarray(a_far, dtype=dtype)
@@ -799,10 +846,12 @@ def evaluate_lpt_lightcone_streaming_radial(
         pending = None  # (x, v, a, mask, shell_idx, extras, r_idx) awaiting _collect
         for r_idx in range(R):
             r_off = replica_offsets[r_idx]
+            rot = (jnp.asarray(rot_mats[r_idx], dtype=dtype)
+                   if rot_mats is not None else None)
             res = kernel(
                 start, chunk_size, r_off, a_mid_d, a_far_d, a_near_d,
                 observer_jax, a_shells_d, residual_tol_d,
-                q_flat_d, psi_flats_d, grad_psi_flats_d,
+                q_flat_d, psi_flats_d, grad_psi_flats_d, rot, box_center_d,
             )
             x, v, a, mask, shell_idx = res[:5]
             extras = res[5:]

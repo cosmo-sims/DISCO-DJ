@@ -36,9 +36,16 @@ FIGDIR = os.path.join(HERE, "figures")
 os.makedirs(FIGDIR, exist_ok=True)
 
 # ---- simulation / survey configuration (kept modest so this runs in minutes) ----
-RES = int(os.environ.get("GALLERY_RES", "128"))
-BOXSIZE = 1500.0           # Mpc/h
-A_FAR, A_NEAR = 0.5, 1.0   # z = 1 -> z = 0
+# Box chosen LARGER than the lightcone (L > 2*chi_max) so the whole past-light
+# ball fits in a SINGLE box (no periodic replication). Replicating one periodic
+# box tiles identical structures every L -> a cubic lattice of repeated
+# superclusters (cubic anisotropy); and there is no artifact-free way to
+# decorrelate replicas of a periodic box (any per-replica rotation/translation
+# breaks the seamless face-matching -> overdense boundary seams). A box bigger
+# than the survey is the clean fix.
+RES = int(os.environ.get("GALLERY_RES", "256"))
+BOXSIZE = float(os.environ.get("GALLERY_BOX", "4000.0"))   # Mpc/h
+A_FAR, A_NEAR = 0.55, 1.0  # z = 0.82 -> z = 0;  chi(0.55) ~ 1977 < BOXSIZE/2
 N_SHELLS = 32
 NSIDE = int(os.environ.get("GALLERY_NSIDE", "256"))  # HEALPix map resolution
 NSIDE_GAL = 128            # galaxy angular map (sparser tracer)

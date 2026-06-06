@@ -843,6 +843,8 @@ class DiscoDJ:
                                 radial_residual_tol: float = 1e-1,
                                 v_mode: str = "radial",
                                 deformation_mode: str = "none",
+                                randomize_replicas: bool = False,
+                                replica_seed: int = 0,
                                 verbose: bool = False) -> dict:
         """Generate past-lightcone particle records from the LPT trajectory.
 
@@ -899,6 +901,8 @@ class DiscoDJ:
                 residual_tol=radial_residual_tol,
                 v_mode=v_mode,
                 deformation_mode=deformation_mode,
+                randomize_replicas=randomize_replicas,
+                replica_seed=replica_seed,
                 verbose=verbose,
             )
         if streaming:
