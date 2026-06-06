@@ -80,6 +80,7 @@ def generate_lightcone(path):
         path, a_far=A_FAR, a_near=A_NEAR, n_shells=N_SHELLS, observer=observer,
         n_part_chunks=4, n_newton_iters=1, v_mode="radial",
         n_resample=N_RESAMPLE, deformation_mode="stream",
+        keep_particle_idx=True,   # to pick galaxies from the *base* sheet only
         map_spec=spec, verbose=True)
     print(f"  -> {summary['n_particles']:,} crossings, "
           f"{summary['n_replicas']} replicas", flush=True)
@@ -131,41 +132,55 @@ def fig_convergence(dj, spec, density_shells, out):
     _save_mollview(out)
 
 
-def _stream_density_threshold(path, percent, stride_rows=37):
-    """Top-`percent` stream-density cut, estimated from a strided subsample."""
+def _galaxy_setup(path, percent):
+    """Determine the base-sheet particle count and the stream-density cut for
+    galaxies, estimated from the *base sheet only* (one particle per Lagrangian
+    cell). Galaxies are 1-per-collapsed-cell tracers, not the oversampled
+    sub-particles — otherwise every sub-particle in a collapsed cell is selected
+    and the cells fill in as a checker pattern."""
     import h5py
     with h5py.File(path, "r") as f:
+        hdr = f["Header"].attrs
+        n_res = int(hdr.get("NumResample", 1))
+        n_part = int(hdr["NumPart_PerReplica"]) // (n_res ** 3)
         g = f["PartType1"]
-        if "StreamDensity" not in g:
-            return None
-        sd = np.asarray(g["StreamDensity"][::stride_rows], dtype=np.float64)
-    return float(np.percentile(sd, 100.0 - percent))
+        if "StreamDensity" not in g or "LagrangianParticleIndex" not in g:
+            return n_part, None
+        lpid = np.asarray(g["LagrangianParticleIndex"][::29])
+        sd = np.asarray(g["StreamDensity"][::29], dtype=np.float64)
+        base = lpid < n_part
+        if not base.any():
+            return n_part, None
+        thresh = float(np.percentile(sd[base], 100.0 - percent))
+    return n_part, thresh
 
 
 def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
     """Stream the catalogue once, gathering: the thin-Dec wedge slice (all mass
     + galaxies), the n(z) histograms, a 3-D subsample, and a galaxy HEALPix
-    count map. Galaxies are the densest phase-space-sheet elements — the top
-    GAL_PERCENT % by stream density 1/|det T| (collapsed knots/filaments).
-    Returns a dict of arrays."""
+    count map. Galaxies are the densest *base-sheet* elements (one per
+    Lagrangian cell, top GAL_PERCENT % by stream density 1/|det T|) so they form
+    a clean point distribution tracing the collapsed knots/filaments rather than
+    filling whole cells. Returns a dict of arrays."""
     import h5py
     from discodj.core.healpix import ang2pix_ring, nside2npix
     obs = np.asarray(observer)
     a_obs_of_z = lambda z: 1.0 / (1.0 + z)
-    gal_thresh = _stream_density_threshold(path, GAL_PERCENT)
+    n_part_base, gal_thresh = _galaxy_setup(path, GAL_PERCENT)
 
     wedge = {k: [] for k in ("ra", "chi_real", "chi_rsd")}
     gwedge = {k: [] for k in ("ra", "chi_real")}     # galaxies in the slice
     z_real_all, z_rsd_all, zg_all = [], [], []
     sub = {k: [] for k in ("x", "y", "z", "redshift")}
     gal_map = np.zeros(nside2npix(NSIDE_GAL), dtype=np.float64)
-    n_tot = n_gal = 0
+    n_tot = n_gal = n_base = 0
     batch = 1 << 22
     with h5py.File(path, "r") as f:
         g = f["PartType1"]
         M = g["Coordinates"].shape[0]
         stride = max(M // n_3d, 1)
-        has_sd = "StreamDensity" in g and gal_thresh is not None
+        has_sd = ("StreamDensity" in g and "LagrangianParticleIndex" in g
+                  and gal_thresh is not None)
         for s in range(0, M, batch):
             e = min(s + batch, M)
             x = np.asarray(g["Coordinates"][s:e], dtype=np.float64)
@@ -182,10 +197,15 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
             z_real_all.append(z_cosmo)
             z_rsd_all.append(z_obs)
             n_tot += e - s
-            # galaxies = densest sheet elements (top GAL_PERCENT % stream density)
+            # galaxies = densest *base-sheet* elements (1 per Lagrangian cell):
+            # restrict to the base sheet (lpid < n_part_base) then take the top
+            # GAL_PERCENT % by stream density -> clean point tracers, no cell fill.
             if has_sd:
                 sd = np.asarray(g["StreamDensity"][s:e], dtype=np.float64)
-                is_gal = sd > gal_thresh
+                lpid = np.asarray(g["LagrangianParticleIndex"][s:e])
+                base_mask = lpid < n_part_base
+                n_base += int(base_mask.sum())
+                is_gal = base_mask & (sd > gal_thresh)
             else:
                 is_gal = np.zeros(e - s, dtype=bool)
             n_gal += int(is_gal.sum())
@@ -219,7 +239,8 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
     cat["z_rsd"] = np.concatenate(z_rsd_all)
     cat["z_gal"] = np.concatenate(zg_all) if zg_all else np.zeros(0)
     cat["gal_map"] = gal_map
-    cat["gal_frac"] = n_gal / max(n_tot, 1)
+    cat["gal_frac"] = n_gal / max(n_base, 1)   # fraction of base-sheet cells
+    cat["n_gal"] = n_gal
     return cat
 
 
@@ -296,8 +317,8 @@ def fig_galaxy_sky(cat, out):
     gmap = hp.smoothing(cat["gal_map"], fwhm=np.radians(1.0))
     plt.close("all")
     hp.mollview(gmap, cmap="cividis", cbar=True, norm="hist",
-                title=f"Galaxy angular density (top {GAL_PERCENT:g}% densest "
-                      f"sheet elements)",
+                title=f"Galaxy angular density (densest {GAL_PERCENT:g}% of "
+                      f"base-sheet cells)",
                 unit="galaxies / pixel (smoothed)", bgcolor="#0d1117")
     hp.graticule(color="#30363d", dpar=30, dmer=30)
     _save_mollview(out)
@@ -329,8 +350,8 @@ def fig_galaxies_web(cat, out):
     ax.set_xlabel("comoving x [Mpc/h]"); ax.set_ylabel("comoving y [Mpc/h]")
     ax.set_title("Galaxies (cyan) tracing the cosmic web over the smooth "
                  "dark-matter density\n"
-                 f"(top {GAL_PERCENT:g}% densest sheet elements = "
-                 f"{cat['gal_frac']*100:.1f}% of the mass)", pad=14)
+                 f"(densest {GAL_PERCENT:g}% of base-sheet cells = "
+                 f"{cat['n_gal']:,} galaxies)", pad=14)
     plt.savefig(out, dpi=140, bbox_inches="tight")
     plt.close("all")
     print(f"  wrote {out}", flush=True)
@@ -531,10 +552,11 @@ def main():
          "aliasing.",
          p_web),
         ("Galaxies from the phase-space sheet",
-         f"Galaxies are the densest sheet elements — the top {GAL_PERCENT:g}% by "
-         "stream density 1/|det&nbsp;T| (the collapsed knots and filaments). They "
-         "cluster strongly, biased relative to the smooth mass: a mock galaxy "
-         "field straight from the sheet's local density.",
+         f"Galaxies are the densest {GAL_PERCENT:g}% of <em>base-sheet</em> cells "
+         "(one tracer per Lagrangian cell, ranked by stream density 1/|det&nbsp;T| "
+         "= collapsed knots/filaments). One galaxy per collapsed cell gives a "
+         "clean point field that clusters strongly, biased relative to the smooth "
+         "mass — a mock galaxy catalogue straight from the sheet topology.",
          p_gweb),
         ("Galaxy angular clustering",
          "The same sheet-selected galaxies on the sky — the angular galaxy "
