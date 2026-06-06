@@ -14,6 +14,44 @@ that the observational-modeling pipeline will consume.
 
 ---
 
+## 0. Gallery — one lightcone, many products
+
+Every panel below comes from a **single** differentiable 2-LPT past-lightcone
+(128³ particles, 1500 Mpc/h box, Planck18 — 32 M crossings) generated and
+rendered by [`make_lightcone_gallery.py`](make_lightcone_gallery.py). The same
+pipeline scales to 1024³ and refreshes across cosmologies for Fisher / inference
+work. **▶ Open the interactive gallery: [`lightcone_gallery.html`](lightcone_gallery.html)**
+(drag-to-rotate 3-D view + full-resolution figures).
+
+#### Smooth fields
+
+| Projected DM density (z ≈ 0.2–0.5 slab) | Weak-lensing convergence κ (Born, z_s = 1) |
+|---|---|
+| ![Projected DM density](figures/sky_density.png) | ![Convergence map](figures/sky_convergence.png) |
+
+Mass painted onto a HEALPix sky from the lightcone shells, and the Born-approx
+convergence from the overdensity shells — both pure-JAX, so `∂C_ℓ/∂θ` flows
+straight back to cosmology.
+
+#### The cosmic web & catalogues
+
+![Cosmic web slice](figures/cosmic_web_wedge.png)
+
+*A 4°-thick slice through the lightcone (observer at centre) — filaments, knots
+and voids straight from the 2-LPT particle catalogue.*
+
+| Redshift-space distortions | Redshift distribution n(z) |
+|---|---|
+| ![RSD comparison](figures/rsd_comparison.png) | ![n(z)](figures/nz_distribution.png) |
+
+The same structures in real vs redshift space (peculiar velocities stretch them
+along the line of sight), and the cosmological-vs-observed redshift distribution.
+
+> Regenerate everything with `python docs/make_lightcone_gallery.py` (needs the
+> `discodj[sky]` extra plus `matplotlib healpy plotly`).
+
+---
+
 ## 1. Quick start
 
 End-to-end: build a 512³ scene, write a lightcone, read it back.

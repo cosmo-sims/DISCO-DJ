@@ -69,7 +69,7 @@ dj.evaluate_lpt_lightcone_to_hdf5(
     observer=np.array([L/2]*3), n_part_chunks=8, n_newton_iters=1,
     keep_particle_idx=True, v_mode="radial", verbose=True)
 ```
-See [docs/lightcone_integration.md](docs/lightcone_integration.md) for the on-disk schema, physical conventions, reader recipes, cosmology-refresh, and the in-memory autodiff entry point.
+See [docs/lightcone_integration.md](docs/lightcone_integration.md) for the on-disk schema, physical conventions, reader recipes, cosmology-refresh, and the in-memory autodiff entry point — and the [visual gallery](docs/lightcone_integration.md#0-gallery--one-lightcone-many-products) (DM density, weak-lensing convergence, the cosmic web, RSD) for what the pipeline produces.
 
 You can also run a quick demo from the commandline:
 ```bash
