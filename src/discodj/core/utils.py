@@ -12,19 +12,12 @@ __all__ = ['is_jax_object', 'scan_fct_np', 'set_indices_to_val', 'add_to_indices
 
 
 def is_jax_object(t: object) -> bool:
-    """Helper function that checks if t is a Jax object.
+    """Helper function that checks if t is a JAX object.
 
     :param t: object to check
     :return: boolean indicating whether t is a Jax object
     """
-    # from version 0.4.1 on: jax.Array type https://jax.readthedocs.io/en/latest/jax_array_migration.html
-    if int(jax.__version__[0]) > 0 or int(jax.__version__[2]) >= 4:
-        return isinstance(t, jax.Array)
-    else:
-        # Legacy
-        return isinstance(t, (jax.xla.DeviceArray, jax.interpreters.partial_eval.DynamicJaxprTracer,
-                              jax.interpreters.batching.BatchTracer, jaxlib.xla_extension.ArrayImpl,
-                              jax.interpreters.ad.JVPTracer))
+    return isinstance(t, jax.Array)
 
 
 def scan_fct_np(f: Callable, init: object, xs: AnyArray | list | tuple, length: int | None = None,
