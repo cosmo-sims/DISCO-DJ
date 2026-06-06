@@ -44,15 +44,17 @@ cosmology.
 *A 4°-thick slice through the lightcone (observer at centre) — filaments, knots
 and voids, smoothly deposited from the sheet (no grid aliasing).*
 
-#### Galaxies from the phase-space sheet
+#### Galaxies (linear Lagrangian bias)
 
 | Galaxies tracing the web | Galaxy angular clustering |
 |---|---|
 | ![Galaxies on the web](figures/galaxies_web.png) | ![Galaxy sky map](figures/galaxy_sky.png) |
 
-Galaxies are the **densest sheet elements** — the top few % by stream density
-`1/|det T|` (the collapsed knots and filaments). They cluster strongly, biased
-relative to the smooth mass: a mock galaxy field straight from the sheet topology.
+Galaxies follow a **basic linear Lagrangian bias**: each Lagrangian cell hosts a
+galaxy with probability `p = n̄(1 + b·δ_L)` (`δ_L` = the linear initial
+overdensity, `b` the bias), then they are advected to their Eulerian lightcone
+positions. The result clusters more strongly than the mass — a clean, unbiased-
+to-biased mock galaxy field (set `b = 0` for an unbiased tracer).
 
 #### Redshift-space & n(z)
 
