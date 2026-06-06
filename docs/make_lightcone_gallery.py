@@ -173,6 +173,8 @@ def read_catalogue(path, observer, dj, gal_cell, dec_halfwidth=2.0, n_3d=40000):
     obs = np.asarray(observer)
     a_obs_of_z = lambda z: 1.0 / (1.0 + z)
     n_part_base = gal_cell.shape[0]
+    hcell = float(dj.boxsize) / dj.res          # comoving cell size, for sub-cell jitter
+    rng_jit = np.random.default_rng(2025)
 
     wedge = {k: [] for k in ("ra", "chi_real", "chi_rsd")}
     gwedge = {k: [] for k in ("ra", "chi_real")}     # galaxies in the slice
@@ -214,11 +216,25 @@ def read_catalogue(path, observer, dj, gal_cell, dec_halfwidth=2.0, n_3d=40000):
                 is_gal = np.zeros(e - s, dtype=bool)
             n_gal += int(is_gal.sum())
             if is_gal.any():
-                gp = ang2pix_ring(NSIDE_GAL, jnp.asarray(theta[is_gal]),
-                                  jnp.asarray(phi[is_gal]))
+                # Sample each galaxy UNIFORMLY within its cell rather than at the
+                # base vertex: a perfect lattice sampled at vertices is NOT
+                # homogeneous on the lightcone (radial sphere-shell rings + cubic
+                # axis spokes); a uniform sub-cell offset removes those geometric
+                # artifacts (independent per replica image).
+                relg = rel[is_gal] + rng_jit.uniform(-hcell / 2, hcell / 2,
+                                                     size=(int(is_gal.sum()), 3))
+                dg = np.linalg.norm(relg, axis=-1)
+                thg, phg = vec2ang(relg)
+                decg = 90.0 - np.degrees(np.asarray(thg))
+                rag = np.degrees(np.asarray(phg))
+                gp = ang2pix_ring(NSIDE_GAL, thg, phg)
                 np.add.at(gal_map, np.asarray(gp), 1.0)
                 zg_all.append(z_cosmo[is_gal])
-            # thin equatorial slice for the wedge (all mass + galaxies)
+                slg = np.abs(decg) < dec_halfwidth
+                if slg.any():
+                    gwedge["ra"].append(np.radians(rag[slg]))
+                    gwedge["chi_real"].append(dg[slg])
+            # thin equatorial slice for the wedge (all mass)
             sl = np.abs(dec) < dec_halfwidth
             if sl.any():
                 a_obs = a_obs_of_z(z_obs[sl])
@@ -226,10 +242,6 @@ def read_catalogue(path, observer, dj, gal_cell, dec_halfwidth=2.0, n_3d=40000):
                 wedge["ra"].append(np.radians(ra[sl]))
                 wedge["chi_real"].append(d[sl])
                 wedge["chi_rsd"].append(chi_rsd)
-                slg = sl & is_gal
-                if slg.any():
-                    gwedge["ra"].append(np.radians(ra[slg]))
-                    gwedge["chi_real"].append(d[slg])
             # 3-D subsample (strided)
             idx = np.arange(0, e - s, stride)
             if idx.size:
