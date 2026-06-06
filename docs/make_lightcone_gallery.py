@@ -43,6 +43,10 @@ N_SHELLS = 32
 NSIDE = 64
 Z_SOURCE = 1.0             # weak-lensing source plane at the far edge
 C_KM_S = 299792.458
+# Phase-space-sheet over-sampling: n_resample^3 sub-particles per Lagrangian
+# cell (each 1/n^3 of the mass), sampled inside the cell by Fourier-interpolating
+# psi -> smooth fixed-mass-per-tetrahedron deposit instead of grid-vertex aliasing.
+N_RESAMPLE = int(os.environ.get("GALLERY_NRESAMPLE", "3"))
 
 plt.rcParams.update({
     "figure.facecolor": "#0d1117", "savefig.facecolor": "#0d1117",
@@ -63,11 +67,12 @@ def generate_lightcone(path):
     spec = MapSpec(nside=NSIDE,
                    a_edges=np.geomspace(A_FAR, A_NEAR, N_SHELLS + 1),
                    weighted=True)
-    print("Generating lightcone catalogue + shell maps ...", flush=True)
+    print(f"Generating lightcone (+ shell maps), n_resample={N_RESAMPLE} "
+          f"-> {N_RESAMPLE**3} sub-particles/cell ...", flush=True)
     summary = dj.evaluate_lpt_lightcone_to_hdf5(
         path, a_far=A_FAR, a_near=A_NEAR, n_shells=N_SHELLS, observer=observer,
         n_part_chunks=4, n_newton_iters=1, v_mode="radial",
-        deformation_mode="stream", map_spec=spec, verbose=True)
+        n_resample=N_RESAMPLE, map_spec=spec, verbose=True)
     print(f"  -> {summary['n_particles']:,} crossings, "
           f"{summary['n_replicas']} replicas", flush=True)
     return dj, observer, spec, summary
@@ -125,7 +130,7 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
     obs = np.asarray(observer)
     a_obs_of_z = lambda z: 1.0 / (1.0 + z)
 
-    wedge = {k: [] for k in ("ra", "chi_real", "chi_rsd", "logrho")}
+    wedge = {k: [] for k in ("ra", "chi_real", "chi_rsd")}
     z_real_all, z_rsd_all = [], []
     sub = {k: [] for k in ("x", "y", "z", "redshift")}
     batch = 1 << 22
@@ -138,7 +143,6 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
             x = np.asarray(g["Coordinates"][s:e], dtype=np.float64)
             vr = np.asarray(g["RadialVelocity"][s:e], dtype=np.float64)
             a = np.asarray(g["ScaleFactor"][s:e], dtype=np.float64)
-            sd = np.asarray(g["StreamDensity"][s:e], dtype=np.float64)
             rel = x - obs[None, :]
             d = np.linalg.norm(rel, axis=-1)
             theta, phi = vec2ang(rel)
@@ -157,7 +161,6 @@ def read_catalogue(path, observer, dj, dec_halfwidth=2.0, n_3d=40000):
                 wedge["ra"].append(np.radians(ra[sl]))
                 wedge["chi_real"].append(d[sl])
                 wedge["chi_rsd"].append(chi_rsd)
-                wedge["logrho"].append(np.log10(np.clip(sd[sl], 1e-3, None)))
             # 3-D subsample (strided)
             idx = np.arange(0, e - s, stride)
             if idx.size:
@@ -205,23 +208,32 @@ def fig_cosmic_web(cat, out):
 
 
 def fig_rsd(cat, out):
-    """Real-space vs redshift-space wedge sector to expose RSD."""
-    # zoom on an RA sector + distance band where structure is rich
-    ra = cat["ra"]; sel = (ra > np.radians(20)) & (ra < np.radians(110))
+    """Real-space vs redshift-space sector as smooth 2-D density images."""
+    ra = cat["ra"]
+    sel = (ra > np.radians(20)) & (ra < np.radians(110))
     sel &= (cat["chi_real"] > 400) & (cat["chi_real"] < 1500)
-    rho = cat["logrho"][sel]
+    th = ra[sel]
     fig, axes = plt.subplots(1, 2, figsize=(13, 6.6),
                              subplot_kw={"projection": "polar"})
+    # shared colour scale across the two panels
+    nb_r, nb_t = 260, 260
+    t_edges = np.linspace(np.radians(20), np.radians(110), nb_t)
+    r_edges = np.linspace(400, 1500, nb_r)
+    imgs = {}
+    for key in ("chi_real", "chi_rsd"):
+        H, _, _ = np.histogram2d(th, cat[key][sel], bins=[t_edges, r_edges])
+        imgs[key] = np.log10(H + 1.0)
+    vmax = max(np.percentile(im[im > 0], 99.5) for im in imgs.values())
+    T, Rr = np.meshgrid(t_edges, r_edges, indexing="ij")
     for ax, key, ttl in ((axes[0], "chi_real", "Real space"),
                          (axes[1], "chi_rsd", "Redshift space (with RSD)")):
         ax.set_facecolor("#05070a")
-        o = np.argsort(rho)
-        ax.scatter(ra[sel][o], cat[key][sel][o], c=rho[o], s=1.1,
-                   cmap="magma", alpha=0.7, linewidths=0)
+        ax.pcolormesh(T, Rr, imgs[key], cmap="magma", vmin=0, vmax=vmax,
+                      shading="auto")
         ax.set_thetamin(20); ax.set_thetamax(110)
         ax.set_ylim(400, 1500); ax.set_yticklabels([])
         ax.set_title(ttl, pad=18)
-        ax.grid(color="#30363d", alpha=0.4)
+        ax.grid(color="#30363d", alpha=0.25)
     fig.suptitle("Redshift-space distortions: peculiar velocities stretch "
                  "structures along the line of sight", y=1.02)
     plt.savefig(out, dpi=140, bbox_inches="tight")
@@ -310,10 +322,13 @@ def build_html(figs, plotly_div, summary, out):
   <h1>DiscoDJ past-lightcones — from smooth fields to catalogues</h1>
   <p>Every panel below comes from a single differentiable 2-LPT past-lightcone
      ({RES}³ particles, {BOXSIZE:.0f} Mpc/h box, Planck18), generated and rendered by
-     <code>docs/make_lightcone_gallery.py</code>. The same pipeline scales to
-     1024³ and refreshes across cosmologies for Fisher / inference work.</p>
+     <code>docs/make_lightcone_gallery.py</code>. Mass is deposited with
+     phase-space-sheet over-sampling ({N_RESAMPLE}³ sub-particles per cell) for a
+     smooth, alias-free field. The same pipeline scales to 1024³ and refreshes
+     across cosmologies for Fisher / inference work.</p>
   <div>
     <span class="stat"><b>{n:,}</b> crossings</span>
+    <span class="stat"><b>{N_RESAMPLE}³</b> sub-particles/cell</span>
     <span class="stat"><b>{summary['n_replicas']}</b> box replicas</span>
     <span class="stat">z = <b>{1/A_FAR-1:.0f}</b> &rarr; <b>0</b></span>
     <span class="stat">pure-JAX, differentiable</span>
@@ -395,9 +410,10 @@ def main():
          "differentiable, so &part;C<sub>&ell;</sub>/&part;&theta; flows back to cosmology.",
          p_kappa),
         ("The cosmic web on the lightcone",
-         "A thin equatorial slice of the particle catalogue in comoving polar "
-         "coordinates, coloured by the per-particle stream density 1/|det&nbsp;T| "
-         "— filaments, knots and voids without any extra clustering step.",
+         "A thin equatorial slice of the catalogue as a smooth 2-D density — "
+         "filaments, knots and voids. Phase-space-sheet over-sampling deposits "
+         "mass <em>inside</em> each Lagrangian cell, so there is no grid-vertex "
+         "aliasing.",
          p_web),
         ("Redshift-space distortions",
          "The same structures in real space vs redshift space: peculiar "

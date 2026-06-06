@@ -17,10 +17,13 @@ that the observational-modeling pipeline will consume.
 ## 0. Gallery — one lightcone, many products
 
 Every panel below comes from a **single** differentiable 2-LPT past-lightcone
-(128³ particles, 1500 Mpc/h box, Planck18 — 32 M crossings) generated and
-rendered by [`make_lightcone_gallery.py`](make_lightcone_gallery.py). The same
-pipeline scales to 1024³ and refreshes across cosmologies for Fisher / inference
-work. **▶ Open the interactive gallery: [`lightcone_gallery.html`](lightcone_gallery.html)**
+(128³ particles, 1500 Mpc/h box, Planck18) generated and rendered by
+[`make_lightcone_gallery.py`](make_lightcone_gallery.py). Mass is deposited with
+**phase-space-sheet over-sampling** (`n_resample`: sub-particles sampled inside
+each Lagrangian cell, fixed mass per tetrahedron) so the fields are smooth and
+free of grid-vertex aliasing. The same pipeline scales to 1024³ and refreshes
+across cosmologies for Fisher / inference work.
+**▶ Open the interactive gallery: [`lightcone_gallery.html`](lightcone_gallery.html)**
 (drag-to-rotate 3-D view + full-resolution figures).
 
 #### Smooth fields
@@ -299,6 +302,16 @@ Key knobs:
 - **`v_mode='radial'`** saves 8 B/row (no information loss for
   redshift-space / kSZ analyses). Use `'full'` if you need transverse
   components.
+- **`n_resample`** (default 1) controls phase-space-sheet over-sampling.
+  `n_resample=1` deposits one particle per Lagrangian cell at its grid vertex,
+  which aliases as a **grid pattern** when the deposited field is rendered at
+  low resolution. `n_resample>1` spawns `n_resample³` sub-particles *inside*
+  each cell (Fourier-interpolating ψ via `core.scatter_and_gather`), each with
+  `1/n_resample³` of the mass, so the deposit approaches the smooth
+  fixed-mass-per-tetrahedron sheet density (Abel/Hahn/Kähler) — no aliasing.
+  It multiplies the row count and runtime by `n_resample³`; use it for smooth
+  *fields/maps* (`map_spec`), not when you only need the discrete catalogue.
+  The Header records `NumResample`.
 - **`compression='zstd'`** maps to multi-threaded Blosc-zstd (~3× faster
   than single-thread zstd at the same ratio). Alternatives:
   `'lz4'` (faster, larger), `'blosc2'` (Blosc2 instead of v1, slightly

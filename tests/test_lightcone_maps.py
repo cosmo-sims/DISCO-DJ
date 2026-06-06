@@ -77,6 +77,28 @@ def test_kappa_is_differentiable():
     assert float(jnp.abs(g).sum()) > 0
 
 
+def test_sheet_resampling_conserves_mass(tmp_path):
+    """Phase-space-sheet over-sampling (n_resample>1) must conserve the total
+    deposited mass and multiply the row count by n_resample^dim."""
+    from discodj.core.io import read_lightcone_header
+    dj = _make_dj()
+    observer = np.array([256.0, 256.0, 256.0])
+    spec = MapSpec(nside=8, a_edges=np.geomspace(0.4, 1.0, 9), weighted=True)
+    kw = dict(a_far=0.4, a_near=1.0, n_shells=16, observer=observer,
+              n_part_chunks=2, n_newton_iters=1, v_mode="radial", map_spec=spec)
+    s1 = dj.evaluate_lpt_lightcone_to_hdf5(str(tmp_path / "nr1.h5"),
+                                           n_resample=1, **kw)
+    s3 = dj.evaluate_lpt_lightcone_to_hdf5(str(tmp_path / "nr3.h5"),
+                                           n_resample=3, **kw)
+    # rows scale as n_resample^dim
+    assert abs(s3["n_particles"] / s1["n_particles"] - 27) < 0.5
+    # total deposited mass is invariant (mass split over the sub-particles)
+    m1 = float(np.asarray(s1["maps"]).sum())
+    m3 = float(np.asarray(s3["maps"]).sum())
+    np.testing.assert_allclose(m3, m1, rtol=0.02)
+    assert read_lightcone_header(str(tmp_path / "nr3.h5"))["NumResample"] == 3
+
+
 def test_on_the_fly_maps_match_posthoc(tmp_path):
     """Maps accumulated during HDF5 generation must match a post-hoc pass over
     the written catalogue."""

@@ -587,14 +587,9 @@ def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
     return kernel
 
 
-def _compute_grad_psi_flats(dj, n_order: int):
-    """Per-order displacement-gradient grids flattened to ``(N^3, 3, 3)`` with
-    ``grid[.., i, j] = d psi_n,i / d q_j``.
-
-    Uses exact Fourier gradients (``order=0``), the same construction as
-    ``DiscoDJ.evaluate_jacobian_from_psi`` but kept per-order so the lightcone
-    kernel can weight each by ``D_n(a)`` at the refined crossing.
-    """
+def _compute_grad_psi_mesh(dj, n_order: int):
+    """Per-order displacement-gradient grids in mesh shape ``(res,..,res,3,3)``
+    with ``grid[.., i, j] = d psi_n,i / d q_j`` (exact Fourier gradients)."""
     from ..core.kernels import gradient_kernel
     from einops import rearrange
     grad_kernels = [gradient_kernel(dj.k_vecs, d, order=0, with_jax=True)
@@ -609,8 +604,69 @@ def _compute_grad_psi_flats(dj, n_order: int):
         dpsi = jax.vmap(jnp.fft.irfftn, in_axes=-1, out_axes=-1)(dpsi)
         # (..., i, j) = d_j psi_i  (component i, gradient direction j)
         dpsi = rearrange(dpsi, "... (d g) -> ... d g", d=dj.dim, g=dj.dim)
-        out.append(dpsi.reshape(-1, dj.dim, dj.dim).astype(dj.dtype))
-    return tuple(out)
+        out.append(dpsi.astype(dj.dtype))
+    return out
+
+
+def _compute_grad_psi_flats(dj, n_order: int):
+    """Per-order displacement-gradient grids flattened to ``(N^3, 3, 3)``.
+
+    Uses exact Fourier gradients (``order=0``), the same construction as
+    ``DiscoDJ.evaluate_jacobian_from_psi`` but kept per-order so the lightcone
+    kernel can weight each by ``D_n(a)`` at the refined crossing.
+    """
+    return tuple(g.reshape(-1, dj.dim, dj.dim)
+                 for g in _compute_grad_psi_mesh(dj, n_order))
+
+
+def _sheet_resampled_fields(dj, n_order: int, shift, need_grad: bool):
+    """Lagrangian positions and displacement (+ gradient) fields for one
+    phase-space-sheet sub-sample offset ``shift`` (in grid-cell units).
+
+    Sub-particles sit at ``q + shift * cell``; their displacement (and its
+    gradient) is the band-limited (Fourier) interpolation of the ``psi`` fields
+    to that offset — i.e. a point *inside* the Lagrangian cube / Kuhn tetrahedra
+    rather than only at the grid vertices. With ``n_resample^dim`` such offsets,
+    each carrying ``1/n_resample^dim`` of the mass, the deposited field
+    approaches the smooth fixed-mass-per-tetrahedron sheet density and the
+    grid-vertex aliasing of a one-point-per-cell deposit disappears.
+
+    Reuses ``core.scatter_and_gather.fourier_interpolate_field`` — the same
+    sheet interpolation the PM force and ``compute_field_quantity_from_particles``
+    use via ``n_resample``.
+    """
+    from ..core.scatter_and_gather import fourier_interpolate_field
+    dim = dj.dim
+    boxsize = float(dj.boxsize)
+    cell = boxsize / dj.res
+    q_flat = jnp.asarray(dj.q.reshape(-1, dim))
+    if onp.allclose(shift, 0.0):
+        psi_flats = tuple(dj._lpt.psi[f"psi_{n}"].reshape(-1, dim)
+                          for n in range(1, n_order + 1))
+        grad = _compute_grad_psi_flats(dj, n_order) if need_grad else ()
+        return q_flat, psi_flats, grad
+    shift = list(onp.asarray(shift, dtype=onp.float64))
+    q_flat = q_flat + jnp.asarray(shift, dtype=dj.dtype) * cell
+    psi_flats = tuple(
+        fourier_interpolate_field(dim, dj._lpt.psi[f"psi_{n}"], shift, boxsize,
+                                  dj.dtype_num).reshape(-1, dim)
+        for n in range(1, n_order + 1))
+    if need_grad:
+        grad = tuple(
+            fourier_interpolate_field(
+                dim, g.reshape(g.shape[:dim] + (dim * dim,)), shift, boxsize,
+                dj.dtype_num).reshape(-1, dim, dim)
+            for g in _compute_grad_psi_mesh(dj, n_order))
+    else:
+        grad = ()
+    return q_flat, psi_flats, grad
+
+
+def _sheet_shift_vectors(dim: int, n_resample: int) -> onp.ndarray:
+    """``(n_resample^dim, dim)`` sub-cell offsets in grid-cell units."""
+    d = onp.linspace(0.0, 1.0, n_resample, endpoint=False)
+    grid = onp.meshgrid(*((d,) * dim), indexing="ij")
+    return onp.stack([g.reshape(-1) for g in grid], axis=-1)
 
 
 # Extra-column schema emitted for each deformation_mode (name -> (shape_tail, dtype)).
@@ -789,6 +845,7 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     residual_tol: float = 1e-1,
     v_mode: str = "radial",
     deformation_mode: str = "none",
+    n_resample: int = 1,
     compression="zstd",
     storage_chunk_rows: int = 1 << 20,
     map_spec=None,
@@ -816,6 +873,15 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     :param v_mode: ``"radial"`` (default) writes a 1-D ``RadialVelocity``
         dataset (line-of-sight component, redshift sign convention). ``"full"``
         writes the 3-D ``Velocities`` dataset. Radial saves 8 B/row.
+    :param n_resample: phase-space-sheet over-sampling factor per dimension.
+        ``1`` (default) deposits one particle per Lagrangian cell at its grid
+        vertex — which aliases as a grid pattern at low resolution. ``>1``
+        spawns ``n_resample^dim`` sub-particles *inside* each cell by Fourier-
+        interpolating ψ (reusing ``core.scatter_and_gather``), each carrying
+        ``1/n_resample^dim`` of the mass, so the deposited density approaches
+        the smooth fixed-mass-per-tetrahedron sheet field. Multiplies the row
+        count (and runtime) by ``n_resample^dim``; the Header records
+        ``NumResample``.
     :param storage_chunk_rows: HDF5 dataset chunk size (rows per compressed
         block). 1<<20 (1M particles) balances compression ratio against
         partial-read efficiency.
@@ -836,7 +902,13 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     assert v_mode in ("radial", "full"), f"v_mode must be 'radial' or 'full', got {v_mode!r}"
     assert deformation_mode in ("none", "stream", "full"), \
         f"deformation_mode must be 'none'|'stream'|'full', got {deformation_mode!r}"
+    assert n_resample >= 1, "n_resample must be >= 1"
     v_is_radial = (v_mode == "radial")
+    # Phase-space-sheet over-sampling: n_resample^dim sub-particles per cell,
+    # each 1/n_resample^dim of the mass, sampled *inside* the Lagrangian cube via
+    # Fourier interpolation of psi -> smooth fixed-mass-per-tetrahedron deposit.
+    shift_vecs = _sheet_shift_vectors(dj.dim, n_resample)
+    n_sub = shift_vecs.shape[0]
     # extra HDF5 columns + in-kernel output keys for the deformation outputs
     def_columns = _deformation_columns(deformation_mode)
     def_keys = {"stream": ["StreamDensity", "TidalEigenvalues"],
@@ -869,9 +941,11 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
 
     n_order_eff = n_order if n_order is not None else dj._lpt.n_order
     N_part = dj.res ** dj.dim
-    n_part_per_replica = N_part
+    # With sheet over-sampling there are n_sub sub-particles per Lagrangian cell.
+    n_part_per_replica = N_part * n_sub
 
-    # Particle mass for the Gadget-like header (one box's worth of mass).
+    # Per-(sub-)particle mass for the Gadget-like header (mass conserved: the
+    # box mass is split over N_part * n_sub sub-particles).
     particle_mass = lightcone_particle_mass(dj.cosmo.Omega_m, boxsize,
                                             n_part_per_replica)
 
@@ -884,6 +958,7 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
         "HubbleParam": float(dj.cosmo.h),
         "MassTable": [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0],
         "NumPart_PerReplica": n_part_per_replica,
+        "NumResample": n_resample,
         "NumFilesPerSnapshot": 1,
         "Time": 1.0,  # not meaningful for a lightcone
     }
@@ -938,119 +1013,123 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
                 out["maps"] = maps_accum
             return out
 
-        # Kernel is observer-independent (observer passed as a runtime arg), so
-        # build it once and reuse across observers.
+        # Kernel is observer- and sheet-independent (q, psi passed as runtime
+        # args), so build it once and reuse across observers and sub-samples.
         kernel = _make_radial_kernel(dj, n_order_eff, n_newton_iters,
                                      v_radial=v_is_radial,
                                      deformation_mode=deformation_mode)
-        # ψ and q as kernel args, not captured constants — avoids the
-        # double-allocation during JIT lowering that OOM'd at N=1024.
-        q_flat_d = jnp.asarray(dj.q.reshape(-1, 3))
-        psi_flats_d = tuple(dj._lpt.psi[f"psi_{n}"].reshape(-1, 3)
-                            for n in range(1, n_order_eff + 1))
-        grad_psi_flats_d = (_compute_grad_psi_flats(dj, n_order_eff)
-                            if deformation_mode != "none" else ())
+        need_grad = deformation_mode != "none"
 
         base = N_part // n_part_chunks
         chunk_starts = [c * base for c in range(n_part_chunks)] + [N_part]
 
-        for obs_idx in range(n_obs):
-            R = R_list[obs_idx]
-            if R == 0:
-                continue
-            observer_host = observers_host[obs_idx]
-            observer_jax = jnp.asarray(observer_host, dtype=dtype)
-            replica_offsets = jnp.asarray(replicas_list[obs_idx], dtype=dtype) * boxsize
+        # Outer loop over phase-space-sheet sub-samples (n_sub = n_resample^dim;
+        # n_sub == 1 reproduces the one-point-per-cell deposit exactly). The
+        # interpolated (q, psi) for a sheet are built once and reused across
+        # observers; ψ and q go in as kernel args, not captured constants —
+        # avoids the double-allocation during JIT lowering that OOM'd at N=1024.
+        for s_idx in range(n_sub):
+            q_flat_d, psi_flats_d, grad_psi_flats_d = _sheet_resampled_fields(
+                dj, n_order_eff, shift_vecs[s_idx], need_grad)
+            lpid_base = s_idx * N_part
 
-            for c in range(n_part_chunks):
-                lo = chunk_starts[c]
-                hi = chunk_starts[c + 1]
-                chunk_size = hi - lo
-                if chunk_size <= 0:
+            for obs_idx in range(n_obs):
+                R = R_list[obs_idx]
+                if R == 0:
                     continue
-                start = jnp.asarray(lo, dtype=jnp.int32)
-                chunk_before = writer.total
+                observer_host = observers_host[obs_idx]
+                observer_jax = jnp.asarray(observer_host, dtype=dtype)
+                replica_offsets = jnp.asarray(replicas_list[obs_idx], dtype=dtype) * boxsize
 
-                # Per-chunk staging across replicas (R typically 1-27): one
-                # contiguous HDF5 append per chunk keeps the per-chunk compress
-                # cost reasonable. Pending-1 ahead lets the next kernel dispatch
-                # overlap with the host gather, same trick as the streaming path.
-                stage_x, stage_v, stage_a = [], [], []
-                stage_rep, stage_shell, stage_lpid = [], [], []
-                stage_def = {k: [] for k in def_keys}
-                pending = None
+                for c in range(n_part_chunks):
+                    lo = chunk_starts[c]
+                    hi = chunk_starts[c + 1]
+                    chunk_size = hi - lo
+                    if chunk_size <= 0:
+                        continue
+                    start = jnp.asarray(lo, dtype=jnp.int32)
+                    chunk_before = writer.total
 
-                def _drain_pending():
-                    nonlocal pending
-                    if pending is None:
-                        return
-                    xp, vp, ap, mp, sp, extras_p, rp = pending
-                    mask_np = onp.asarray(mp)
-                    if mask_np.any():
-                        sel = onp.where(mask_np)[0]
-                        stage_x.append(onp.asarray(xp)[sel, :].astype(onp.float32))
-                        vp_np = onp.asarray(vp)
-                        stage_v.append((vp_np[sel, :] if vp_np.ndim == 2 else vp_np[sel])
-                                       .astype(onp.float32))
-                        stage_a.append(onp.asarray(ap)[sel].astype(onp.float32))
-                        stage_rep.append(onp.full(sel.size, rp, dtype=onp.int16))
-                        stage_shell.append(onp.asarray(sp)[sel].astype(onp.int16))
-                        if keep_particle_idx:
-                            stage_lpid.append((sel + lo).astype(onp.int32))
-                        for k, arr in zip(def_keys, extras_p):
-                            stage_def[k].append(onp.asarray(arr)[sel].astype(onp.float32))
+                    # Per-chunk staging across replicas (R typically 1-27): one
+                    # contiguous HDF5 append per chunk keeps the per-chunk compress
+                    # cost reasonable. Pending-1 ahead lets the next kernel dispatch
+                    # overlap with the host gather, same trick as the streaming path.
+                    stage_x, stage_v, stage_a = [], [], []
+                    stage_rep, stage_shell, stage_lpid = [], [], []
+                    stage_def = {k: [] for k in def_keys}
                     pending = None
 
-                for r_idx in range(R):
-                    r_off = replica_offsets[r_idx]
-                    res = kernel(
-                        start, chunk_size, r_off, a_mid_d, a_far_d, a_near_d,
-                        observer_jax, a_shells_d, residual_tol_d,
-                        q_flat_d, psi_flats_d, grad_psi_flats_d,
-                    )
-                    x, v, a_arr, mask, shell_idx = res[:5]
-                    extras = res[5:]
+                    def _drain_pending():
+                        nonlocal pending
+                        if pending is None:
+                            return
+                        xp, vp, ap, mp, sp, extras_p, rp = pending
+                        mask_np = onp.asarray(mp)
+                        if mask_np.any():
+                            sel = onp.where(mask_np)[0]
+                            stage_x.append(onp.asarray(xp)[sel, :].astype(onp.float32))
+                            vp_np = onp.asarray(vp)
+                            stage_v.append((vp_np[sel, :] if vp_np.ndim == 2 else vp_np[sel])
+                                           .astype(onp.float32))
+                            stage_a.append(onp.asarray(ap)[sel].astype(onp.float32))
+                            stage_rep.append(onp.full(sel.size, rp, dtype=onp.int16))
+                            stage_shell.append(onp.asarray(sp)[sel].astype(onp.int16))
+                            if keep_particle_idx:
+                                stage_lpid.append((sel + lo + lpid_base).astype(onp.int32))
+                            for k, arr in zip(def_keys, extras_p):
+                                stage_def[k].append(onp.asarray(arr)[sel].astype(onp.float32))
+                        pending = None
+
+                    for r_idx in range(R):
+                        r_off = replica_offsets[r_idx]
+                        res = kernel(
+                            start, chunk_size, r_off, a_mid_d, a_far_d, a_near_d,
+                            observer_jax, a_shells_d, residual_tol_d,
+                            q_flat_d, psi_flats_d, grad_psi_flats_d,
+                        )
+                        x, v, a_arr, mask, shell_idx = res[:5]
+                        extras = res[5:]
+                        _drain_pending()
+                        pending = (x, v, a_arr, mask, shell_idx, extras, r_idx)
                     _drain_pending()
-                    pending = (x, v, a_arr, mask, shell_idx, extras, r_idx)
-                _drain_pending()
 
-                # Concatenate this chunk's staging across replicas and flush.
-                if stage_x:
-                    x_c = onp.concatenate(stage_x);     stage_x.clear()
-                    v_c = onp.concatenate(stage_v);     stage_v.clear()
-                    a_c = onp.concatenate(stage_a);     stage_a.clear()
-                    rep_c = onp.concatenate(stage_rep); stage_rep.clear()
-                    shell_c = onp.concatenate(stage_shell); stage_shell.clear()
-                    lpid_c = onp.concatenate(stage_lpid) if stage_lpid else None
-                    if stage_lpid:
-                        stage_lpid.clear()
-                    extra_c = {k: onp.concatenate(stage_def[k]) for k in def_keys}
-                    for k in def_keys:
-                        stage_def[k].clear()
-                    if multi_obs:
-                        extra_c["ObserverIndex"] = onp.full(
-                            x_c.shape[0], obs_idx, dtype=onp.int16)
-                    writer.append(x=x_c, v=v_c, a=a_c, replica_idx=rep_c,
-                                  shell_idx=shell_c, particle_idx=lpid_c,
-                                  extra=(extra_c or None))
-                    if map_spec is not None:
-                        from .lightcone_maps import accumulate_shell_maps
-                        mw = (onp.full(x_c.shape[0], particle_mass, dtype=onp.float32)
-                              if map_spec.weighted else None)
-                        partial = onp.asarray(accumulate_shell_maps(
-                            x_c, a_c, observer_host, map_spec, mass_weight=mw),
-                            dtype=onp.float64)
+                    # Concatenate this chunk's staging across replicas and flush.
+                    if stage_x:
+                        x_c = onp.concatenate(stage_x);     stage_x.clear()
+                        v_c = onp.concatenate(stage_v);     stage_v.clear()
+                        a_c = onp.concatenate(stage_a);     stage_a.clear()
+                        rep_c = onp.concatenate(stage_rep); stage_rep.clear()
+                        shell_c = onp.concatenate(stage_shell); stage_shell.clear()
+                        lpid_c = onp.concatenate(stage_lpid) if stage_lpid else None
+                        if stage_lpid:
+                            stage_lpid.clear()
+                        extra_c = {k: onp.concatenate(stage_def[k]) for k in def_keys}
+                        for k in def_keys:
+                            stage_def[k].clear()
                         if multi_obs:
-                            maps_accum[obs_idx] += partial
-                        else:
-                            maps_accum += partial
-                    del x_c, v_c, a_c, rep_c, shell_c, lpid_c
+                            extra_c["ObserverIndex"] = onp.full(
+                                x_c.shape[0], obs_idx, dtype=onp.int16)
+                        writer.append(x=x_c, v=v_c, a=a_c, replica_idx=rep_c,
+                                      shell_idx=shell_c, particle_idx=lpid_c,
+                                      extra=(extra_c or None))
+                        if map_spec is not None:
+                            from .lightcone_maps import accumulate_shell_maps
+                            mw = (onp.full(x_c.shape[0], particle_mass, dtype=onp.float32)
+                                  if map_spec.weighted else None)
+                            partial = onp.asarray(accumulate_shell_maps(
+                                x_c, a_c, observer_host, map_spec, mass_weight=mw),
+                                dtype=onp.float64)
+                            if multi_obs:
+                                maps_accum[obs_idx] += partial
+                            else:
+                                maps_accum += partial
+                        del x_c, v_c, a_c, rep_c, shell_c, lpid_c
 
-                if verbose:
-                    print(f"  observer {obs_idx+1}/{n_obs} chunk {c+1}/"
-                          f"{n_part_chunks} (particles {lo}-{hi}): "
-                          f"{writer.total - chunk_before} new, {writer.total} total",
-                          flush=True)
+                    if verbose:
+                        print(f"  sheet {s_idx+1}/{n_sub} observer {obs_idx+1}/"
+                              f"{n_obs} chunk {c+1}/{n_part_chunks} "
+                              f"(particles {lo}-{hi}): {writer.total - chunk_before}"
+                              f" new, {writer.total} total", flush=True)
 
         writer.close()
         _write_maps(h5f)
