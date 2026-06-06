@@ -19,6 +19,7 @@ Disco-DJ includes
  *  **forward and reverse-mode** automatic differentiation
  *  N-GenIC IC generation
  *  reading/writing Gadget4 and SWIFT snapshots
+ *  **past-lightcone catalogues** from the analytic nLPT trajectory *or* the N-body run, with periodic-box replication, fp32-accurate per-particle crossings, streaming HDF5 output (Gadget-like), fast differentiable cosmology-refresh for parameter sweeps, plus differentiable **sky projection / HEALPix maps / Born convergence**, per-row **deformation & tidal fields**, **multi-observer** mock skies, and exporters to Gadget/SWIFT, CosmoDC2/SkyCatalog, and HEALPix FITS (see [docs/lightcone_integration.md](docs/lightcone_integration.md))
 
 
 ## Requirements:
@@ -53,6 +54,22 @@ dj = dj.with_lpt(n_order=1)
 X, P, a = dj.run_nbody(a_ini=0.02, a_end=1.0, n_steps=10, res_pm=512, stepper="bullfrog")
 ```
 Please see the notebooks for more detailed examples.
+
+To build a past-lightcone catalogue from an LPT scene and write it to HDF5:
+```python
+from discodj import DiscoDJ
+import numpy as np
+
+L, N = 3468.0, 512
+dj = (DiscoDJ(dim=3, res=N, boxsize=L, cosmo="Planck18EEBAOSN")
+        .with_timetables().with_linear_ps().with_ics(seed=42).with_lpt(n_order=2))
+
+dj.evaluate_lpt_lightcone_to_hdf5(
+    "/tmp/lc.h5", a_far=0.25, a_near=2/3, n_shells=128,
+    observer=np.array([L/2]*3), n_part_chunks=8, n_newton_iters=1,
+    keep_particle_idx=True, v_mode="radial", verbose=True)
+```
+See [docs/lightcone_integration.md](docs/lightcone_integration.md) for the on-disk schema, physical conventions, reader recipes, cosmology-refresh, and the in-memory autodiff entry point.
 
 You can also run a quick demo from the commandline:
 ```bash

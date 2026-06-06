@@ -18,7 +18,147 @@ except ImportError:
     _hdf5plugin = None
 
 __all__ = ["save_as_hdf5", "save_lightcone_as_hdf5",
-           "compression_kwargs", "read_lightcone_header"]
+           "compression_kwargs", "read_lightcone_header",
+           "LightconeHDF5Writer", "lightcone_particle_mass"]
+
+
+def lightcone_particle_mass(omega_m: float, boxsize: float,
+                            n_part_per_replica: int) -> float:
+    """Gadget per-particle mass (10^10 M_sun/h) for one box's worth of matter.
+
+    ``m = Omega_m * 3 H0^2 / (8 pi G) * L^3 / N_part`` with H0 = 100 h and
+    ``G = 43.0071...`` in Mpc/(10^10 Msun) (km/s)^2.
+    """
+    G = 43.007105731706317
+    Hubble = 100.0
+    return float(omega_m * 3.0 * Hubble * Hubble / (8.0 * onp.pi * G)
+                 * boxsize ** 3 / max(int(n_part_per_replica), 1))
+
+
+class LightconeHDF5Writer:
+    """Incremental writer for past-lightcone HDF5 catalogues (Gadget-like).
+
+    Centralises the on-disk schema shared by every lightcone producer in
+    DiscoDJ: the ``/Header`` group, the extendable ``/PartType1`` datasets,
+    the Gadget ``sqrt(a)`` velocity conversion, the sequential
+    ``ParticleIDs``/constant ``Masses`` columns, and the 32-bit/HighWord
+    split of ``NumPart_*`` written on :meth:`close`.
+
+    It wraps an already-open ``h5py.File`` (so callers that also need to read
+    an input file in the same ``with`` block stay in control of the handle)
+    and appends crossings one contiguous block at a time, so peak RAM holds at
+    most one block — never the full catalogue.
+
+    Standard columns (always created):
+      ``Coordinates`` (M,3) f32, ``ScaleFactor`` (M,) f32,
+      ``ParticleIDs`` (M,) u64, ``Masses`` (M,) f32,
+      ``ReplicaIndex`` (M,) i16, ``ShellIndex`` (M,) i16, and either
+      ``RadialVelocity`` (M,) or ``Velocities`` (M,3) depending on
+      ``v_is_radial``. ``LagrangianParticleIndex`` (M,) i32 is added iff
+      ``keep_particle_idx``.
+
+    Extra per-row columns (e.g. ``ObserverIndex``, ``StreamDensity``,
+    ``TidalEigenvalues``, ``DeformationTensor``) are declared via
+    ``extra_columns`` as ``{name: (shape_tail, dtype)}`` and supplied to
+    :meth:`append` through its ``extra`` dict.
+    """
+
+    def __init__(self, h5f, *, particle_mass, v_is_radial,
+                 keep_particle_idx=False, extra_columns=None,
+                 compression="zstd", storage_chunk_rows=1 << 20,
+                 prefix="PartType1/"):
+        self.h5f = h5f
+        self.prefix = prefix
+        self.particle_mass = float(particle_mass)
+        self.v_is_radial = bool(v_is_radial)
+        self.total = 0
+        self._header = None
+        ds_kwargs = compression_kwargs(compression)
+
+        def _mkds(name, shape_tail, dt):
+            return h5f.create_dataset(
+                prefix + name, shape=(0,) + shape_tail,
+                maxshape=(None,) + shape_tail,
+                chunks=(storage_chunk_rows,) + shape_tail,
+                dtype=dt, **ds_kwargs)
+
+        self._d_coords = _mkds("Coordinates", (3,), onp.float32)
+        self._d_vel = (_mkds("RadialVelocity", (), onp.float32) if v_is_radial
+                       else _mkds("Velocities", (3,), onp.float32))
+        self._d_a = _mkds("ScaleFactor", (), onp.float32)
+        self._d_pid = _mkds("ParticleIDs", (), onp.uint64)
+        self._d_mass = _mkds("Masses", (), onp.float32)
+        self._d_rep = _mkds("ReplicaIndex", (), onp.int16)
+        self._d_shell = _mkds("ShellIndex", (), onp.int16)
+        self._d_lpid = (_mkds("LagrangianParticleIndex", (), onp.int32)
+                        if keep_particle_idx else None)
+        self._extra = {}
+        for name, (shape_tail, dt) in (extra_columns or {}).items():
+            self._extra[name] = _mkds(name, shape_tail, dt)
+
+    @classmethod
+    def open(cls, h5f, *, header_attrs, **kwargs):
+        """Create the ``/Header`` group from ``header_attrs`` and the
+        ``/PartType1`` datasets, returning a ready-to-append writer. The
+        ``NumPart_*`` attrs are filled in by :meth:`close`; everything else in
+        ``header_attrs`` is written verbatim."""
+        header = h5f.create_group("Header")
+        for k, val in header_attrs.items():
+            header.attrs[k] = val
+        writer = cls(h5f, **kwargs)
+        writer._header = header
+        return writer
+
+    def append(self, *, x, v, a, replica_idx, shell_idx,
+               particle_idx=None, extra=None):
+        """Append one contiguous block of crossings.
+
+        ``v`` is the internal velocity (``dPsi/d(tildet) = a^2 dx/dt``); it is
+        converted to the Gadget ``v_g = v * 100 / a^1.5`` convention here,
+        handling both the radial scalar and the full 3-vector. ``ParticleIDs``
+        and ``Masses`` are generated internally.
+        """
+        n_new = int(x.shape[0])
+        if n_new == 0:
+            return
+        new_total = self.total + n_new
+        lo, hi = self.total, new_total
+
+        a_arr = onp.asarray(a)
+        a_safe = onp.where(a_arr > 0, a_arr, 1.0)
+        v = onp.asarray(v)
+        if self.v_is_radial:
+            v_g = v * (100.0 / a_safe ** 1.5)
+            self._d_vel.resize((new_total,)); self._d_vel[lo:hi] = v_g
+        else:
+            v_g = v * (100.0 / a_safe[:, None] ** 1.5)
+            self._d_vel.resize((new_total, 3)); self._d_vel[lo:hi, :] = v_g
+
+        self._d_coords.resize((new_total, 3)); self._d_coords[lo:hi, :] = x
+        self._d_a.resize((new_total,)); self._d_a[lo:hi] = a_arr
+        self._d_rep.resize((new_total,)); self._d_rep[lo:hi] = replica_idx
+        self._d_shell.resize((new_total,)); self._d_shell[lo:hi] = shell_idx
+        self._d_pid.resize((new_total,))
+        self._d_pid[lo:hi] = onp.arange(lo, hi, dtype=onp.uint64)
+        self._d_mass.resize((new_total,)); self._d_mass[lo:hi] = self.particle_mass
+        if self._d_lpid is not None and particle_idx is not None:
+            self._d_lpid.resize((new_total,)); self._d_lpid[lo:hi] = particle_idx
+        for name, ds in self._extra.items():
+            val = (extra or {})[name]
+            ds.resize((new_total,) + tuple(ds.shape[1:]))
+            ds[lo:hi] = val
+        self.total = new_total
+
+    def close(self):
+        """Write the final ``NumPart_*`` attrs (32-bit low word + HighWord
+        split, so catalogues with >2^32 rows round-trip)."""
+        if self._header is None:
+            return
+        low = self.total & 0xFFFFFFFF
+        high = self.total >> 32
+        self._header.attrs["NumPart_ThisFile"] = [0, low, 0, 0, 0, 0]
+        self._header.attrs["NumPart_Total"] = [0, low, 0, 0, 0, 0]
+        self._header.attrs["NumPart_Total_HighWord"] = [0, high, 0, 0, 0, 0]
 
 
 def read_lightcone_header(path: str) -> dict:
@@ -56,6 +196,7 @@ def read_lightcone_header(path: str) -> dict:
         else:
             out["v_mode"] = None
         out["has_particle_idx"] = "LagrangianParticleIndex" in ds
+        out["has_observer_idx"] = "ObserverIndex" in ds
     return out
 
 

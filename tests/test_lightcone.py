@@ -268,6 +268,57 @@ def test_save_lightcone_hdf5(tmp_path):
         assert f["PartType1/ShellIndex"].dtype == np.int16
 
 
+def test_lightcone_hdf5_writer_roundtrip(tmp_path):
+    """LightconeHDF5Writer builds the standard schema, converts velocities to
+    the Gadget convention, generates sequential IDs, and supports extra
+    per-row columns + the >2^32 NumPart split."""
+    import h5py
+    from discodj.core.io import (LightconeHDF5Writer, lightcone_particle_mass,
+                                  read_lightcone_header)
+
+    pm = lightcone_particle_mass(0.3, 512.0, 8 ** 3)
+    header_attrs = {
+        "LightconeMode": 1, "Observer": np.array([256.0, 256.0, 256.0]),
+        "BoxSize": 512.0, "Omega0": 0.3, "OmegaLambda": 0.7, "HubbleParam": 0.7,
+        "MassTable": [0.0, pm, 0.0, 0.0, 0.0, 0.0], "NumPart_PerReplica": 8 ** 3,
+        "NumFilesPerSnapshot": 1, "Time": 1.0,
+    }
+    path = str(tmp_path / "writer.h5")
+    a = np.array([0.5, 0.8], dtype=np.float32)
+    v = np.array([10.0, -20.0], dtype=np.float32)  # radial scalar
+    with h5py.File(path, "w") as f:
+        w = LightconeHDF5Writer.open(
+            f, header_attrs=header_attrs, particle_mass=pm, v_is_radial=True,
+            keep_particle_idx=True,
+            extra_columns={"ObserverIndex": ((), np.int16)})
+        # two appends -> IDs must stay globally sequential across blocks
+        w.append(x=np.zeros((1, 3), np.float32), v=v[:1], a=a[:1],
+                 replica_idx=np.array([0], np.int16),
+                 shell_idx=np.array([3], np.int16),
+                 particle_idx=np.array([42], np.int32),
+                 extra={"ObserverIndex": np.array([0], np.int16)})
+        w.append(x=np.ones((1, 3), np.float32), v=v[1:], a=a[1:],
+                 replica_idx=np.array([1], np.int16),
+                 shell_idx=np.array([5], np.int16),
+                 particle_idx=np.array([99], np.int32),
+                 extra={"ObserverIndex": np.array([1], np.int16)})
+        w.close()
+
+    meta = read_lightcone_header(path)
+    assert meta["n_particles"] == 2
+    assert meta["v_mode"] == "radial"
+    assert meta["has_particle_idx"] is True
+    with h5py.File(path, "r") as f:
+        g = f["PartType1"]
+        assert list(g["ParticleIDs"][:]) == [0, 1]            # sequential across appends
+        assert list(g["LagrangianParticleIndex"][:]) == [42, 99]
+        assert list(g["ObserverIndex"][:]) == [0, 1]
+        # Gadget velocity convention applied with each row's own a_cross
+        np.testing.assert_allclose(g["RadialVelocity"][:],
+                                   v * (100.0 / a ** 1.5), rtol=1e-5)
+        np.testing.assert_allclose(g["Masses"][:], pm, rtol=1e-6)
+
+
 def test_radial_sort_matches_shell_loop():
     """The radial-sort path should agree with the shell-loop Newton path on
     (a_cross, x, v) up to small boundary differences (the radial-sort applies

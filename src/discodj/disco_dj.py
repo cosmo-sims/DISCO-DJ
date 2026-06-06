@@ -842,6 +842,7 @@ class DiscoDJ:
                                 radial_sort: bool = False,
                                 radial_residual_tol: float = 1e-1,
                                 v_mode: str = "radial",
+                                deformation_mode: str = "none",
                                 verbose: bool = False) -> dict:
         """Generate past-lightcone particle records from the LPT trajectory.
 
@@ -897,6 +898,7 @@ class DiscoDJ:
                 keep_particle_idx=keep_particle_idx,
                 residual_tol=radial_residual_tol,
                 v_mode=v_mode,
+                deformation_mode=deformation_mode,
                 verbose=verbose,
             )
         if streaming:
@@ -956,8 +958,10 @@ class DiscoDJ:
                                         keep_particle_idx: bool = False,
                                         radial_residual_tol: float = 1e-1,
                                         v_mode: str = "radial",
+                                        deformation_mode: str = "none",
                                         compression="zstd",
                                         storage_chunk_rows: int = 1 << 20,
+                                        map_spec=None,
                                         verbose: bool = False) -> dict:
         """Generate a radial-sort lightcone and write directly to HDF5.
 
@@ -966,7 +970,11 @@ class DiscoDJ:
         crossings — not the full catalogue. Use this when the catalogue would
         not fit in RAM (N >= 768 on a 128 GB host).
 
-        :return: ``{"n_particles": int, "n_replicas": int}`` summary.
+        :param map_spec: optional ``discodj.lpt.lightcone_maps.MapSpec``. When
+            given, HEALPix shell maps are accumulated on the fly and written to
+            a ``/Maps`` group (also returned under ``"maps"``).
+        :return: ``{"n_particles": int, "n_replicas": int}`` summary (plus
+            ``"maps"`` if ``map_spec`` is given).
         """
         from .lpt.lightcone import evaluate_lpt_lightcone_to_hdf5_radial
         return evaluate_lpt_lightcone_to_hdf5_radial(
@@ -977,10 +985,35 @@ class DiscoDJ:
             keep_particle_idx=keep_particle_idx,
             residual_tol=radial_residual_tol,
             v_mode=v_mode,
+            deformation_mode=deformation_mode,
             compression=compression,
             storage_chunk_rows=storage_chunk_rows,
+            map_spec=map_spec,
             verbose=verbose,
         )
+
+    def run_nbody_lightcone(self, output_path: str, a_ini: float, a_end: float,
+                            n_steps: int, observer: Array | None = None, *,
+                            res_pm: int | None = None, v_mode: str = "radial",
+                            keep_particle_idx: bool = False, compression="zstd",
+                            storage_chunk_rows: int = 1 << 20,
+                            verbose: bool = False, **nbody_kwargs) -> dict:
+        """Generate a past-lightcone from an N-body run, streaming to HDF5.
+
+        Consecutive integrator steps act as crossing brackets; only two
+        snapshots are held in memory at a time, so this scales to large N. The
+        output schema matches the LPT lightcone. See
+        ``discodj.nbody.lightcone_nbody.run_nbody_lightcone`` for details and
+        extra ``run_nbody`` keyword arguments.
+
+        :return: ``{"n_particles": int, "n_replicas": int, "n_steps": int}``.
+        """
+        from .nbody.lightcone_nbody import run_nbody_lightcone as _run
+        return _run(self, output_path, a_ini=a_ini, a_end=a_end, n_steps=n_steps,
+                    observer=observer, res_pm=res_pm, v_mode=v_mode,
+                    keep_particle_idx=keep_particle_idx, compression=compression,
+                    storage_chunk_rows=storage_chunk_rows, verbose=verbose,
+                    **nbody_kwargs)
 
     # Eulerian acceleration via Vlasov-Poisson equation
     def evaluate_lpt_eulerian_acc_at_a(self, a: Array | float, n_order: int | None = None) -> Array:
@@ -1037,7 +1070,7 @@ class DiscoDJ:
                   chunk_size: int | None = None, return_all_a: bool = False,
                   exact_growth: bool = False, convert_to_numpy: bool = False, use_diffrax: bool = False,
                   adjoint_method: bool | None = None, collect_all: bool = False, use_custom_derivatives: bool = True,
-                  return_displacement: bool = False) \
+                  return_displacement: bool = False, step_callback=None) \
             -> tuple[Array, Array, Array]:
         """Run a simulation and return the output.
 
@@ -1085,6 +1118,12 @@ class DiscoDJ:
         :param use_custom_derivatives: whether to use custom derivatives for the acceleration computation if available
             (not implemented for all acceleration methods)
         :param return_displacement: whether to return the displacements instead of positions (defaults to False)
+        :param step_callback: optional host-driven hook ``f(step, a, X_flat, P_flat)`` invoked once per
+            integration step (including the initial state, step 0). When provided, the time integration is
+            run as a Python loop over the existing stepper (no ``lax.scan``), so only the current state is
+            held in memory — used by the streaming N-body lightcone. ``X_flat`` is the *un-wrapped* position
+            ``q + Psi`` (N, dim) and ``P_flat`` the canonical momentum ``a^2 dx/dt`` (N, dim). Incompatible
+            with the adjoint method and Diffrax; the normal final-state return value is still produced.
         :returns: positions (or displacements), velocities, all (if return_all_a=True) / final scale factor(s)
         """
         dtype = self.dtype
@@ -1100,6 +1139,11 @@ class DiscoDJ:
         # Use adjoint method if no forward mode is required and not collect_all
         if adjoint_method is None:
             adjoint_method = not self._requires_jacfwd and not collect_all
+        # The host-driven step_callback path runs a plain Python stepping loop;
+        # it is incompatible with the adjoint custom-VJP scan.
+        if step_callback is not None:
+            adjoint_method = False
+            assert not use_diffrax, "step_callback is not supported with use_diffrax=True"
 
         if adjoint_method:
             assert not self._requires_jacfwd, "The adjoint method is not compatible with Jacobian forward mode!"
@@ -1189,6 +1233,9 @@ class DiscoDJ:
 
         # Will return all_a if requested or otherwise a_save (which is a_end if not collect_all)
         a_out = solver.all_a_and_internal[0] if (return_all_a or collect_all) else a_end
+        # Per-step scale factors (a_ini ... a_end), needed by the step_callback path.
+        all_a_host = onp.asarray(jax.device_get(solver.all_a_and_internal[0])) \
+            if step_callback is not None else None
 
         # Get the acceleration function
         if method == "exact":
@@ -1282,6 +1329,31 @@ class DiscoDJ:
 
             if self.dtype_num == 32 and jax.config.read("jax_enable_x64"):
                 Psi_out, Mom_out = Psi_out.astype(jnp.float32), Mom_out.astype(jnp.float32)
+
+        # Host-driven stepping loop (streaming consumers, e.g. lightcones)
+        elif step_callback is not None:
+            from functools import partial as _partial
+            step_fct = _partial(solver.step, terms=terms, args=args,
+                                solver_state=None, made_jump=None)
+            q_flat = self.ensure_flat_shape(self.q)
+
+            def _emit(k, state):
+                Psi_k, Mom_k = state
+                a_k = float(all_a_host[k])
+                X_flat = q_flat + Psi_k                          # un-wrapped
+                # canonical momentum a^2 dx/dt, same conversion as the final
+                # return (v_to_Pi then * Fplus).
+                P_flat = v_to_Pi(Mom_k, a_k) * self.cosmo.Fplus(a_k)
+                step_callback(k, a_k, X_flat, P_flat)
+
+            carry = (Psi_ini, Mom_ini)
+            _emit(0, carry)
+            for k in range(n_steps):
+                carry = step_fct(y0=carry, t0=k, t1=k + 1)[0]
+                _emit(k + 1, carry)
+            # Mimic the collect_all=False return shape (leading axis squeezed below).
+            Psi_out = carry[0][None]
+            Mom_out = carry[1][None]
 
         # Without diffrax
         else:

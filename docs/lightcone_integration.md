@@ -507,17 +507,106 @@ Catalogue sizes (radial-velocity layout, Blosc-zstd compression, observed):
 
 ---
 
+## 9b. Extended capabilities
+
+These build on the catalogue above; all the HEALPix / sky math is pure JAX, so
+maps and convergence stay differentiable for Fisher / gradient work. The extra
+runtime dependencies (`astropy`, `pyarrow`) come from the `discodj[sky]` extra;
+HEALPix itself needs **no** dependency.
+
+### Sky projection & masks (`discodj.lpt.sky`)
+
+```python
+from discodj.lpt.sky import cartesian_to_sky, sky_mask, add_sky_columns
+sky = cartesian_to_sky(x, observer, cosmo, v_radial=vr, with_rsd=True)
+# sky: {"ra","dec","z_cosmo","z_obs","chi"}  (RA∈[0,360), Dec∈[-90,90] deg)
+keep = sky_mask(sky["ra"], sky["dec"], sky["z_obs"],
+                healpix_mask=mask, z_range=(0.1, 1.2))
+add_sky_columns("/path/lc.h5", with_rsd=True)   # append RA/Dec/Redshift[/RSD] in place
+```
+RSD uses the stored Gadget √a velocity: `v_pec = v_radial/√a`,
+`z_obs = (1+z_cosmo)(1 + v_pec/c) − 1` (positive = receding).
+
+### HEALPix shell maps & Born convergence (`discodj.lpt.lightcone_maps`)
+
+```python
+from discodj.lpt.lightcone_maps import (MapSpec, accumulate_shell_maps,
+    shells_to_overdensity, density_shells_to_kappa)
+spec = MapSpec(nside=512, a_edges=np.geomspace(0.25, 2/3, 33), weighted=True)
+# on-the-fly during generation (no second pass, particle file optional):
+summary = dj.evaluate_lpt_lightcone_to_hdf5("/path/lc.h5", ..., map_spec=spec)
+maps = summary["maps"]                       # (n_bins, npix), also in /Maps/ShellMaps
+delta = shells_to_overdensity(maps)
+kappa = density_shells_to_kappa(delta, spec.a_edges, cosmo, z_source=1.0)
+```
+`ang2pix_ring` matches `healpy.ang2pix` exactly. With multiple observers the
+stack is `(n_obs, n_bins, npix)`.
+
+### Deformation / tidal / velocity-gradient columns (`deformation_mode`)
+
+Per-row tensors evaluated from LPT at each crossing's refined `a`
+(`T = I + Σ_n D_n(a) ∂ψ_n`; exact per-particle gather, no interpolation):
+
+```python
+dj.evaluate_lpt_lightcone_to_hdf5("/path/lc.h5", ..., deformation_mode="stream")
+#   "none" (default) | "stream" -> StreamDensity (M,), TidalEigenvalues (M,3)
+#                     | "full"   -> DeformationTensor (M,3,3), VelocityGradient (M,3,3)
+```
+`StreamDensity = 1/|det T|` (caustics); `TidalEigenvalues` are the ascending
+eigenvalues of the symmetric part of `T` (cosmic-web classification).
+
+### Multiple observers
+
+Pass `observer` as `(n_obs, 3)` to write many independent mock skies into one
+file (covariance estimation). An `ObserverIndex` (int16) column is added and the
+Header gains `Observers`/`NumObservers`; each observer gets its own replica set.
+The single-`(3,)` path is unchanged.
+
+### Format exporters (`discodj.lpt.lightcone_export`)
+
+```python
+from discodj.lpt.lightcone_export import (to_radec_table, to_skycatalog,
+    to_gadget_lightcone_hdf5, write_healpix_fits)
+to_radec_table("/path/lc.h5", "cat.parquet", fmt="parquet")   # or "hdf5"/"fits"
+to_skycatalog("/path/lc.h5", "skycat.parquet")                # CosmoDC2/SkyCatalog-style
+to_gadget_lightcone_hdf5("/path/lc.h5", "swift.h5", flavor="swift")  # or "gadget4"
+write_healpix_fits(kappa, "kappa.fits")                       # healpy-readable
+```
+
+### N-body past-lightcone (`DiscoDJ.run_nbody_lightcone`)
+
+Interleaved crossing detection inside the PM / Tree-PM stepping loop — only two
+snapshots are held in memory, so it scales like a normal N-body run. Consecutive
+integrator steps are the crossing brackets (linear-in-`a`); output schema is
+identical to the LPT lightcone (so §1–§8 tooling applies unchanged).
+
+```python
+dj.run_nbody_lightcone("/path/lc_nbody.h5", a_ini=0.25, a_end=1.0, n_steps=40,
+                       observer=[L/2]*3, res_pm=2*N, stepper="bullfrog",
+                       v_mode="radial", keep_particle_idx=True)
+# -> {"n_particles", "n_replicas", "n_steps"};  Header LightconeSource="nbody"
+```
+Captures full non-linear small-scale dynamics that the analytic LPT trajectory
+cannot; `ShellIndex` is the bracket (step) index. Single observer; not autodiff.
+
+---
+
 ## 10. Where things live
 
 | Path | Contents |
 |---|---|
-| `src/discodj/lpt/lightcone.py` | radial-sort kernel, shell-loop fallback, `evaluate_lpt_lightcone_streaming{,_radial}`, `evaluate_lpt_lightcone_to_hdf5_radial` |
+| `src/discodj/lpt/lightcone.py` | radial-sort kernel, shell-loop fallback, `evaluate_lpt_lightcone_streaming{,_radial}`, `evaluate_lpt_lightcone_to_hdf5_radial`, `deformation_mode`/multi-observer/`map_spec` hooks |
 | `src/discodj/lpt/lightcone_refresh.py` | `save_lpt_scene`, `load_lpt_scene`, `load_refresh_inputs`, `refresh_lightcone_cosmology`, `refresh_lightcone_arrays` |
-| `src/discodj/core/io.py` | `save_lightcone_as_hdf5`, `compression_kwargs`, `read_lightcone_header` |
-| `src/discodj/disco_dj.py` | `DiscoDJ.evaluate_lpt_lightcone`, `.evaluate_lpt_lightcone_to_hdf5`, `.save_lpt_scene`, `DiscoDJ.refresh_lightcone_cosmology` |
+| `src/discodj/lpt/sky.py` | `cartesian_to_sky`, `sky_mask`, `add_sky_columns` |
+| `src/discodj/lpt/lightcone_maps.py` | `MapSpec`, `accumulate_shell_maps`, `shells_to_overdensity`, `density_shells_to_kappa` |
+| `src/discodj/lpt/lightcone_export.py` | `to_radec_table`, `to_skycatalog`, `to_gadget_lightcone_hdf5`, `write_healpix_fits` |
+| `src/discodj/core/healpix.py` | pure-JAX `ang2pix_ring`, `vec2ang`, `accumulate_map`, RA/Dec conversions |
+| `src/discodj/nbody/lightcone_nbody.py` | `run_nbody_lightcone` (interleaved N-body lightcone) |
+| `src/discodj/core/io.py` | `LightconeHDF5Writer`, `lightcone_particle_mass`, `save_lightcone_as_hdf5`, `compression_kwargs`, `read_lightcone_header` |
+| `src/discodj/disco_dj.py` | `DiscoDJ.evaluate_lpt_lightcone{,_to_hdf5}`, `.run_nbody_lightcone`, `.save_lpt_scene`, `.refresh_lightcone_cosmology` |
 | `src/discodj/cosmology/cosmology.py` | `Cosmology` (JAX PyTree, lazily-built timetables) |
 | `src/discodj/cosmology/predefined_cosmologies.py` | the four preset strings |
-| `tests/test_lightcone.py` | end-to-end + HDF5 round-trip tests |
+| `tests/test_lightcone*.py`, `tests/test_sky.py` | end-to-end + HDF5 round-trip + healpy-validation tests |
 
 ---
 
@@ -579,6 +668,16 @@ To *refresh* a catalogue you additionally need:
 jax
 discodj
 ```
+
+For the **sky projection / map / export** tooling (§9b), install the extra:
+
+```
+pip install "discodj[sky]"     # adds astropy (FITS) + pyarrow (Parquet)
+```
+
+The HEALPix utilities (`discodj.core.healpix`) and all map math are pure JAX and
+need no extra dependency; `healpy` is only used in the test-suite to validate
+`ang2pix_ring`. The N-body lightcone needs nothing beyond `discodj` + `jax`.
 
 All file paths in this document are relative to the DiscoDJ repository
 root.

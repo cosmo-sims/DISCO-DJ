@@ -35,8 +35,10 @@ dependencies = [
 gadget = ["pylians", "tqdm"]
 wavelets = ["pywavelets"]
 hdf5 = ["h5py"]
+sky = ["astropy", "pyarrow"]
 docs = ["sphinx", "furo", "myst-nb", "tqdm"]
-all = ["pylians", "tqdm", "pywavelets", "h5py"]
+test = ["pytest", "healpy", "astropy", "pyarrow", "h5py"]
+all = ["pylians", "tqdm", "pywavelets", "h5py", "astropy", "pyarrow"]
 
 [project.urls]
 Homepage = "https://github.com/cosmo-sims/DISCO-DJ/"

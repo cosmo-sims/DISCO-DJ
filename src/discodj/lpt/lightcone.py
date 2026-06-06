@@ -116,6 +116,21 @@ def enumerate_replicas(boxsize: float, observer: onp.ndarray, chi_min: float, ch
     return onp.array(kept, dtype=onp.int32)
 
 
+def _parse_observers(observer, boxsize: float) -> onp.ndarray:
+    """Normalise the ``observer`` argument to a host ``(n_obs, 3)`` float64
+    array. ``None`` -> a single box-centre observer; ``(3,)`` -> one observer;
+    ``(n_obs, 3)`` -> a batch of independent observers."""
+    if observer is None:
+        return (onp.array([0.5, 0.5, 0.5], dtype=onp.float64) * boxsize)[None, :]
+    obs = onp.asarray(observer, dtype=onp.float64)
+    if obs.ndim == 1:
+        assert obs.shape == (3,), "observer must be (3,) or (n_obs, 3)."
+        return obs[None, :]
+    assert obs.ndim == 2 and obs.shape[1] == 3, \
+        "observer must be (3,) or (n_obs, 3)."
+    return obs
+
+
 def evaluate_lpt_lightcone(dj, a_far: float, a_near: float, n_shells: int = 64,
                             observer=None, n_order: int | None = None,
                             exact_growth: bool = False):
@@ -405,7 +420,7 @@ def _make_chunked_lpt_eval(dj, n_order: int):
 
 
 def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
-                          v_radial: bool = True):
+                          v_radial: bool = True, deformation_mode: str = "none"):
     """Build a per-chunk per-replica kernel that finds each particle's single
     lightcone crossing in one shot — no shell loop.
 
@@ -422,13 +437,25 @@ def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
         8 B/row in the catalogue; for most lightcone-cosmology pipelines only
         the radial component matters (redshift-space distortions, kSZ, etc.).
 
+    :param deformation_mode: per-row deformation outputs evaluated at the
+        refined ``a``. ``"none"`` (default) adds nothing. ``"stream"`` appends
+        ``(stream_density, tidal_evals)`` where ``stream_density = 1/|det T|``
+        and ``tidal_evals`` are the ascending eigenvalues of the symmetric part
+        of the deformation tensor ``T = I + sum_n D^n grad psi_n`` (cosmic-web
+        classification). ``"full"`` appends ``(T, velocity_gradient)`` as
+        ``(chunk, 3, 3)`` tensors. When not ``"none"`` the kernel takes a
+        trailing ``grad_psi_flats`` tuple of ``(N^3, 3, 3)`` gradient grids.
+
     Returns ``kernel(start, chunk_size, r_offset, a_mid, a_far, a_near,
-    observer, a_shells, residual_tol) -> (x, v_out, a, crosses, shell_idx)``,
+    observer, a_shells, residual_tol, q_flat, psi_flats[, grad_psi_flats])
+    -> (x, v_out, a, crosses, shell_idx[, *deformation outputs])``,
     where ``v_out`` is (chunk,) if v_radial else (chunk, 3).
     """
     cosmo = dj.cosmo
     dtype = dj.dtype
     c_over_H0 = jnp.asarray(2997.92458, dtype=dtype)  # Mpc/h
+    assert deformation_mode in ("none", "stream", "full"), \
+        f"deformation_mode must be 'none'|'stream'|'full', got {deformation_mode!r}"
 
     # NOTE: q_flat and the psi_n_flat fields are passed as *kernel arguments*
     # (not closure-captured), so JIT lowering treats them as inputs rather
@@ -439,7 +466,7 @@ def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
     @partial(jax.jit, static_argnames=("chunk_size",))
     def kernel(start, chunk_size, r_offset, a_mid, a_far, a_near,
                observer, a_shells, residual_tol,
-               q_flat, psi_flats):
+               q_flat, psi_flats, grad_psi_flats=()):
         # Slice LPT data for this chunk
         q_chunk = jax.lax.dynamic_slice_in_dim(q_flat, start, chunk_size, axis=0)
         psi_chunks = tuple(
@@ -525,9 +552,76 @@ def _make_radial_kernel(dj, n_order: int, n_newton_iters: int,
         else:
             v_out = v_final
 
+        # 8. Optional deformation / tidal / velocity-gradient at the refined a.
+        # Each row is a Lagrangian particle, so gathering ∂_j ψ_n is exact (no
+        # spatial interpolation). T_ij = δ_ij + Σ_n D^n ∂_j ψ_n,i;
+        # ∂v_i/∂q_j = Σ_n n D^n (dD_t/D) ∂_j ψ_n,i.
+        if deformation_mode != "none":
+            grad_chunks = tuple(
+                jax.lax.dynamic_slice_in_dim(g, start, chunk_size, axis=0)
+                for g in grad_psi_flats
+            )
+            eye = jnp.broadcast_to(jnp.eye(3, dtype=dtype),
+                                   (chunk_size, 3, 3))
+            T = eye
+            vel_grad = jnp.zeros((chunk_size, 3, 3), dtype=dtype)
+            D_pow_n = D
+            for n_idx, g in enumerate(grad_chunks):
+                n = n_idx + 1
+                T = T + D_pow_n[:, None, None] * g
+                vel_grad = vel_grad + (n * D_pow_n * dD_t_over_D)[:, None, None] * g
+                D_pow_n = D_pow_n * D
+            if deformation_mode == "stream":
+                detT = jnp.linalg.det(T)
+                detT_safe = jnp.where(jnp.abs(detT) > 1e-30, detT, 1.0)
+                stream_density = 1.0 / jnp.abs(detT_safe)
+                T_sym = 0.5 * (T + jnp.swapaxes(T, -1, -2))
+                tidal_evals = jnp.linalg.eigvalsh(T_sym)  # ascending (chunk, 3)
+                return (x_final, v_out, a, crosses, shell_idx,
+                        stream_density, tidal_evals)
+            # full
+            return x_final, v_out, a, crosses, shell_idx, T, vel_grad
+
         return x_final, v_out, a, crosses, shell_idx
 
     return kernel
+
+
+def _compute_grad_psi_flats(dj, n_order: int):
+    """Per-order displacement-gradient grids flattened to ``(N^3, 3, 3)`` with
+    ``grid[.., i, j] = d psi_n,i / d q_j``.
+
+    Uses exact Fourier gradients (``order=0``), the same construction as
+    ``DiscoDJ.evaluate_jacobian_from_psi`` but kept per-order so the lightcone
+    kernel can weight each by ``D_n(a)`` at the refined crossing.
+    """
+    from ..core.kernels import gradient_kernel
+    from einops import rearrange
+    grad_kernels = [gradient_kernel(dj.k_vecs, d, order=0, with_jax=True)
+                    for d in range(dj.dim)]
+    out = []
+    for n in range(1, n_order + 1):
+        psi_mesh = dj.ensure_mesh_shape(dj._lpt.psi[f"psi_{n}"])
+        dpsi = jnp.asarray([
+            jax.vmap(jnp.fft.rfftn, in_axes=-1, out_axes=-1)(psi_mesh) * g[..., None]
+            for g in grad_kernels])
+        dpsi = rearrange(dpsi, "g ... d -> ... (d g)")
+        dpsi = jax.vmap(jnp.fft.irfftn, in_axes=-1, out_axes=-1)(dpsi)
+        # (..., i, j) = d_j psi_i  (component i, gradient direction j)
+        dpsi = rearrange(dpsi, "... (d g) -> ... d g", d=dj.dim, g=dj.dim)
+        out.append(dpsi.reshape(-1, dj.dim, dj.dim).astype(dj.dtype))
+    return tuple(out)
+
+
+# Extra-column schema emitted for each deformation_mode (name -> (shape_tail, dtype)).
+def _deformation_columns(deformation_mode: str):
+    if deformation_mode == "stream":
+        return {"StreamDensity": ((), onp.float32),
+                "TidalEigenvalues": ((3,), onp.float32)}
+    if deformation_mode == "full":
+        return {"DeformationTensor": ((3, 3), onp.float32),
+                "VelocityGradient": ((3, 3), onp.float32)}
+    return {}
 
 
 def evaluate_lpt_lightcone_streaming_radial(
@@ -537,6 +631,7 @@ def evaluate_lpt_lightcone_streaming_radial(
     keep_particle_idx: bool = False,
     residual_tol: float = 1e-1,  # Mpc/h
     v_mode: str = "radial",
+    deformation_mode: str = "none",
     verbose: bool = False,
 ):
     """Radial-sort variant: solve each (particle, replica) for its single
@@ -555,13 +650,22 @@ def evaluate_lpt_lightcone_streaming_radial(
     :param v_mode: ``"radial"`` (default) emits the line-of-sight velocity
         v · n̂ as ``out["v_radial"]`` (M,). ``"full"`` emits the 3-D vector as
         ``out["v"]`` (M, 3). Radial-only saves 8 B/row.
+    :param deformation_mode: ``"none"`` (default), ``"stream"`` (adds
+        ``out["stream_density"]`` (M,) and ``out["tidal_evals"]`` (M, 3)), or
+        ``"full"`` (adds ``out["deformation"]`` and ``out["velocity_gradient"]``,
+        both (M, 3, 3)). Evaluated from LPT at each crossing's refined a.
     """
     assert dj.dim == 3, "Lightcones are 3-D only."
     assert dj._lpt is not None, "Compute LPT first via with_lpt() / compute_lpt()."
     assert n_newton_iters >= 1, "radial_sort requires n_newton_iters >= 1"
     assert n_part_chunks >= 1, "n_part_chunks must be >= 1"
     assert v_mode in ("radial", "full"), f"v_mode must be 'radial' or 'full', got {v_mode!r}"
+    assert deformation_mode in ("none", "stream", "full"), \
+        f"deformation_mode must be 'none'|'stream'|'full', got {deformation_mode!r}"
     v_is_radial = (v_mode == "radial")
+    # in-memory output keys for the extra deformation arrays, in kernel order
+    _DEF_KEYS = {"stream": ["stream_density", "tidal_evals"],
+                 "full": ["deformation", "velocity_gradient"]}.get(deformation_mode, [])
 
     boxsize = float(dj.boxsize)
     if observer is None:
@@ -594,17 +698,22 @@ def evaluate_lpt_lightcone_streaming_radial(
     N_part = dj.res ** dj.dim
     base = N_part // n_part_chunks
     chunk_starts = [c * base for c in range(n_part_chunks)] + [N_part]
-    kernel = _make_radial_kernel(dj, n_order_eff, n_newton_iters, v_radial=v_is_radial)
+    kernel = _make_radial_kernel(dj, n_order_eff, n_newton_iters,
+                                 v_radial=v_is_radial,
+                                 deformation_mode=deformation_mode)
     # Pass ψ and q as kernel args (not closure) so they aren't duplicated as
     # captured constants during JIT lowering. Materialise once here.
     q_flat_d = jnp.asarray(dj.q.reshape(-1, 3))
     psi_flats_d = tuple(dj._lpt.psi[f"psi_{n}"].reshape(-1, 3)
                         for n in range(1, n_order_eff + 1))
+    grad_psi_flats_d = (_compute_grad_psi_flats(dj, n_order_eff)
+                        if deformation_mode != "none" else ())
 
     buf_x, buf_v, buf_a, buf_rep, buf_shell, buf_part = [], [], [], [], [], []
+    buf_def = {k: [] for k in _DEF_KEYS}
     total = 0
 
-    def _collect_radial(x, v, a, mask, shell_idx, lo, r_idx):
+    def _collect_radial(x, v, a, mask, shell_idx, extras, lo, r_idx):
         nonlocal total
         mask_np = onp.asarray(mask)
         if not mask_np.any():
@@ -619,6 +728,8 @@ def evaluate_lpt_lightcone_streaming_radial(
         buf_shell.append(onp.asarray(shell_idx)[sel].astype(onp.int16))
         if keep_particle_idx:
             buf_part.append((sel + lo).astype(onp.int32))
+        for k, arr in zip(_DEF_KEYS, extras):
+            buf_def[k].append(onp.asarray(arr)[sel].astype(onp.float32))
         total += int(sel.size)
 
     for c in range(n_part_chunks):
@@ -629,25 +740,27 @@ def evaluate_lpt_lightcone_streaming_radial(
             continue
         start = jnp.asarray(lo, dtype=jnp.int32)
         chunk_before = total
-        pending = None  # (x, v, a, mask, shell_idx, r_idx) awaiting _collect
+        pending = None  # (x, v, a, mask, shell_idx, extras, r_idx) awaiting _collect
         for r_idx in range(R):
             r_off = replica_offsets[r_idx]
-            x, v, a, mask, shell_idx = kernel(
+            res = kernel(
                 start, chunk_size, r_off, a_mid_d, a_far_d, a_near_d,
                 observer_jax, a_shells_d, residual_tol_d,
-                q_flat_d, psi_flats_d,
+                q_flat_d, psi_flats_d, grad_psi_flats_d,
             )
+            x, v, a, mask, shell_idx = res[:5]
+            extras = res[5:]
             if pending is not None:
-                _collect_radial(*pending[:5], lo=lo, r_idx=pending[5])
-            pending = (x, v, a, mask, shell_idx, r_idx)
+                _collect_radial(*pending[:6], lo=lo, r_idx=pending[6])
+            pending = (x, v, a, mask, shell_idx, extras, r_idx)
         if pending is not None:
-            _collect_radial(*pending[:5], lo=lo, r_idx=pending[5])
+            _collect_radial(*pending[:6], lo=lo, r_idx=pending[6])
         if verbose:
             print(f"  chunk {c+1}/{n_part_chunks} (particles {lo}-{hi}): "
                   f"{total - chunk_before} new, {total} total")
 
     if total == 0:
-        return _empty_streaming_result(keep_particle_idx)
+        return _empty_streaming_result(keep_particle_idx, v_is_radial=v_is_radial)
 
     # Concatenate-and-discard: clear each buf list immediately after building
     # its concatenated array so per-chunk slices are released before the next
@@ -662,6 +775,8 @@ def evaluate_lpt_lightcone_streaming_radial(
     out["shell_idx"] = onp.concatenate(buf_shell, axis=0); buf_shell.clear()
     if keep_particle_idx:
         out["particle_idx"] = onp.concatenate(buf_part, axis=0); buf_part.clear()
+    for k in _DEF_KEYS:
+        out[k] = onp.concatenate(buf_def[k], axis=0); buf_def[k].clear()
     return out
 
 
@@ -673,8 +788,10 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     keep_particle_idx: bool = False,
     residual_tol: float = 1e-1,
     v_mode: str = "radial",
+    deformation_mode: str = "none",
     compression="zstd",
     storage_chunk_rows: int = 1 << 20,
+    map_spec=None,
     verbose: bool = False,
 ) -> dict:
     """Radial-sort lightcone with incremental HDF5 writes.
@@ -691,23 +808,39 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     LagrangianParticleIndex if ``keep_particle_idx=True``.
 
     :param output_path: HDF5 file to write.
+    :param observer: ``(3,)`` for one observer (default box centre) or
+        ``(n_obs, 3)`` to write many independent mock skies into one file. With
+        more than one observer an ``ObserverIndex`` column is added and the
+        Header gains ``Observers``/``NumObservers``; each observer gets its own
+        periodic-replica set.
     :param v_mode: ``"radial"`` (default) writes a 1-D ``RadialVelocity``
         dataset (line-of-sight component, redshift sign convention). ``"full"``
         writes the 3-D ``Velocities`` dataset. Radial saves 8 B/row.
     :param storage_chunk_rows: HDF5 dataset chunk size (rows per compressed
         block). 1<<20 (1M particles) balances compression ratio against
         partial-read efficiency.
-    :return: ``{"n_particles": int, "n_replicas": int}`` summary.
+    :param map_spec: optional :class:`discodj.lpt.lightcone_maps.MapSpec`. When
+        given, the crossings are also binned into a ``(n_bins, npix)`` HEALPix
+        shell-map stack *during* generation (no second pass), written to a
+        ``/Maps`` group and returned under ``"maps"`` in the summary.
+    :return: ``{"n_particles": int, "n_replicas": int}`` summary (plus
+        ``"maps"`` if ``map_spec`` is given).
     """
     import h5py
-    from ..core.io import compression_kwargs as _compression_kwargs
+    from ..core.io import LightconeHDF5Writer, lightcone_particle_mass
 
     assert dj.dim == 3, "Lightcones are 3-D only."
     assert dj._lpt is not None, "Compute LPT first via with_lpt() / compute_lpt()."
     assert n_newton_iters >= 1, "to_hdf5_radial requires n_newton_iters >= 1"
     assert n_part_chunks >= 1, "n_part_chunks must be >= 1"
     assert v_mode in ("radial", "full"), f"v_mode must be 'radial' or 'full', got {v_mode!r}"
+    assert deformation_mode in ("none", "stream", "full"), \
+        f"deformation_mode must be 'none'|'stream'|'full', got {deformation_mode!r}"
     v_is_radial = (v_mode == "radial")
+    # extra HDF5 columns + in-kernel output keys for the deformation outputs
+    def_columns = _deformation_columns(deformation_mode)
+    def_keys = {"stream": ["StreamDensity", "TidalEigenvalues"],
+                "full": ["DeformationTensor", "VelocityGradient"]}.get(deformation_mode, [])
 
     # Release the with_lpt JIT compile cache before we allocate lightcone
     # buffers. At N=512 this frees ~28 GB that XLA was holding for compute_core
@@ -718,11 +851,9 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     jax.clear_caches()
 
     boxsize = float(dj.boxsize)
-    if observer is None:
-        observer_host = onp.array([0.5, 0.5, 0.5], dtype=onp.float64) * boxsize
-    else:
-        observer_host = onp.asarray(observer, dtype=onp.float64)
-        assert observer_host.shape == (3,), "observer must be a (3,) vector."
+    observers_host = _parse_observers(observer, boxsize)
+    n_obs = observers_host.shape[0]
+    multi_obs = n_obs > 1
 
     dtype = dj.dtype
     a_mid = float(onp.sqrt(a_far * a_near))
@@ -731,194 +862,209 @@ def evaluate_lpt_lightcone_to_hdf5_radial(
     chi_min = float(chi_shells_host[-1])
     chi_max = float(chi_shells_host[0])
 
-    replicas = enumerate_replicas(boxsize, observer_host, chi_min, chi_max)
-    R = replicas.shape[0]
+    # Per-observer periodic-box replica sets (host-side, cheap).
+    replicas_list = [enumerate_replicas(boxsize, observers_host[i], chi_min, chi_max)
+                     for i in range(n_obs)]
+    R_list = [int(r.shape[0]) for r in replicas_list]
 
     n_order_eff = n_order if n_order is not None else dj._lpt.n_order
     N_part = dj.res ** dj.dim
     n_part_per_replica = N_part
 
     # Particle mass for the Gadget-like header (one box's worth of mass).
-    G = 43.007105731706317
-    Hubble = 100.0
-    particle_mass = float(
-        dj.cosmo.Omega_m * 3.0 * Hubble * Hubble / (8.0 * onp.pi * G)
-        * boxsize ** 3 / n_part_per_replica
-    )
+    particle_mass = lightcone_particle_mass(dj.cosmo.Omega_m, boxsize,
+                                            n_part_per_replica)
 
-    ds_kwargs = _compression_kwargs(compression)
+    header_attrs = {
+        "LightconeMode": 1,
+        "Observer": observers_host[0],
+        "BoxSize": boxsize,
+        "Omega0": float(dj.cosmo.Omega_m),
+        "OmegaLambda": float(dj.cosmo.Omega_de),
+        "HubbleParam": float(dj.cosmo.h),
+        "MassTable": [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0],
+        "NumPart_PerReplica": n_part_per_replica,
+        "NumFilesPerSnapshot": 1,
+        "Time": 1.0,  # not meaningful for a lightcone
+    }
+    if multi_obs:
+        header_attrs["Observers"] = observers_host
+        header_attrs["NumObservers"] = n_obs
+
+    # Per-observer ObserverIndex column only when there is more than one sky.
+    extra_columns = dict(def_columns)
+    if multi_obs:
+        extra_columns["ObserverIndex"] = ((), onp.int16)
+
+    # Optional on-the-fly HEALPix shell-map accumulation. For multiple observers
+    # the maps stack as (n_obs, n_bins, npix) for sample-covariance estimation.
+    maps_accum = None
+    if map_spec is not None:
+        maps_accum = onp.zeros(((n_obs,) + map_spec.shape) if multi_obs
+                               else map_spec.shape, dtype=onp.float64)
+
+    def _write_maps(h5f):
+        if map_spec is None:
+            return
+        grp = h5f.create_group("Maps")
+        grp.attrs["nside"] = map_spec.nside
+        grp.attrs["a_edges"] = map_spec.a_edges
+        grp.attrs["weighted"] = int(map_spec.weighted)
+        grp.create_dataset("ShellMaps", data=maps_accum.astype(onp.float32))
+
+    a_shells_d = jnp.asarray(a_shells_host, dtype=dtype)
+    a_far_d = jnp.asarray(a_far, dtype=dtype)
+    a_near_d = jnp.asarray(a_near, dtype=dtype)
+    a_mid_d = jnp.asarray(a_mid, dtype=dtype)
+    residual_tol_d = jnp.asarray(residual_tol, dtype=dtype)
 
     with h5py.File(output_path, "w") as h5f:
-        header = h5f.create_group("Header")
-        header.attrs["LightconeMode"] = 1
-        header.attrs["Observer"] = observer_host
-        header.attrs["BoxSize"] = boxsize
-        header.attrs["Omega0"] = float(dj.cosmo.Omega_m)
-        header.attrs["OmegaLambda"] = float(dj.cosmo.Omega_de)
-        header.attrs["HubbleParam"] = float(dj.cosmo.h)
-        header.attrs["MassTable"] = [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0]
-        header.attrs["NumPart_PerReplica"] = n_part_per_replica
-        header.attrs["NumFilesPerSnapshot"] = 1
-        header.attrs["Time"] = 1.0  # not meaningful for a lightcone
+        writer = LightconeHDF5Writer.open(
+            h5f, header_attrs=header_attrs, particle_mass=particle_mass,
+            v_is_radial=v_is_radial, keep_particle_idx=keep_particle_idx,
+            extra_columns=extra_columns,
+            compression=compression, storage_chunk_rows=storage_chunk_rows)
 
-        prefix = "PartType1/"
-
-        def _mkds(name, shape_tail, dt):
-            shape = (0,) + shape_tail
-            maxshape = (None,) + shape_tail
-            chunks = (storage_chunk_rows,) + shape_tail
-            return h5f.create_dataset(prefix + name, shape=shape, maxshape=maxshape,
-                                       chunks=chunks, dtype=dt, **ds_kwargs)
-
-        d_coords = _mkds("Coordinates", (3,), onp.float32)
-        if v_is_radial:
-            d_vel = _mkds("RadialVelocity", (), onp.float32)
-        else:
-            d_vel = _mkds("Velocities",     (3,), onp.float32)
-        d_a      = _mkds("ScaleFactor", (),   onp.float32)
-        # uint64 because lightcone catalogues at N >= 1024 exceed 2^32 rows.
-        d_pid    = _mkds("ParticleIDs", (),   onp.uint64)
-        d_mass   = _mkds("Masses",      (),   onp.float32)
-        d_rep    = _mkds("ReplicaIndex",(),   onp.int16)
-        d_shell  = _mkds("ShellIndex",  (),   onp.int16)
-        d_lpid   = (_mkds("LagrangianParticleIndex", (), onp.int32)
-                    if keep_particle_idx else None)
-
-        if R == 0:
-            header.attrs["NumPart_ThisFile"] = [0, 0, 0, 0, 0, 0]
-            header.attrs["NumPart_Total"] = [0, 0, 0, 0, 0, 0]
-            header.attrs["NumPart_Total_HighWord"] = [0, 0, 0, 0, 0, 0]
+        if sum(R_list) == 0:
+            writer.close()
+            _write_maps(h5f)
             if verbose:
                 print(f"Lightcone written to {output_path} (0 particles; no "
                       f"replicas intersect the active shell).", flush=True)
-            return {"n_particles": 0, "n_replicas": 0}
+            out = {"n_particles": 0, "n_replicas": 0}
+            if multi_obs:
+                out["n_observers"] = n_obs
+            if map_spec is not None:
+                out["maps"] = maps_accum
+            return out
 
-        replica_offsets = jnp.asarray(replicas, dtype=dtype) * boxsize  # (R, 3)
-        observer_jax = jnp.asarray(observer_host, dtype=dtype)
-        a_shells_d = jnp.asarray(a_shells_host, dtype=dtype)
-        a_far_d = jnp.asarray(a_far, dtype=dtype)
-        a_near_d = jnp.asarray(a_near, dtype=dtype)
-        a_mid_d = jnp.asarray(a_mid, dtype=dtype)
-        residual_tol_d = jnp.asarray(residual_tol, dtype=dtype)
+        # Kernel is observer-independent (observer passed as a runtime arg), so
+        # build it once and reuse across observers.
         kernel = _make_radial_kernel(dj, n_order_eff, n_newton_iters,
-                                     v_radial=v_is_radial)
+                                     v_radial=v_is_radial,
+                                     deformation_mode=deformation_mode)
         # ψ and q as kernel args, not captured constants — avoids the
         # double-allocation during JIT lowering that OOM'd at N=1024.
         q_flat_d = jnp.asarray(dj.q.reshape(-1, 3))
         psi_flats_d = tuple(dj._lpt.psi[f"psi_{n}"].reshape(-1, 3)
                             for n in range(1, n_order_eff + 1))
+        grad_psi_flats_d = (_compute_grad_psi_flats(dj, n_order_eff)
+                            if deformation_mode != "none" else ())
 
         base = N_part // n_part_chunks
         chunk_starts = [c * base for c in range(n_part_chunks)] + [N_part]
-        total = 0
 
-        def _flush(x, v, a_arr, rep_idx, shell_idx, lpid):
-            """Append a contiguous crossings block to the HDF5 datasets."""
-            nonlocal total
-            n_new = x.shape[0]
-            if n_new == 0:
-                return
-            new_total = total + n_new
-            # Gadget velocity convention: v_g = v * 100 / a^1.5 per-particle
-            # (same scalar factor for radial or full vector components)
-            a_safe = onp.where(a_arr > 0, a_arr, 1.0)
-            if v_is_radial:
-                v_gadget = v * (100.0 / a_safe ** 1.5)
-                d_vel.resize((new_total,));     d_vel[total:new_total] = v_gadget
-            else:
-                v_gadget = v * (100.0 / a_safe[:, None] ** 1.5)
-                d_vel.resize((new_total, 3));   d_vel[total:new_total, :] = v_gadget
-
-            d_coords.resize((new_total, 3));  d_coords[total:new_total, :] = x
-            d_a.resize((new_total,));         d_a[total:new_total] = a_arr
-            d_rep.resize((new_total,));       d_rep[total:new_total] = rep_idx
-            d_shell.resize((new_total,));     d_shell[total:new_total] = shell_idx
-            d_pid.resize((new_total,))
-            d_pid[total:new_total] = onp.arange(total, new_total, dtype=onp.uint64)
-            d_mass.resize((new_total,))
-            d_mass[total:new_total] = particle_mass
-            if d_lpid is not None and lpid is not None:
-                d_lpid.resize((new_total,))
-                d_lpid[total:new_total] = lpid
-            total = new_total
-
-        for c in range(n_part_chunks):
-            lo = chunk_starts[c]
-            hi = chunk_starts[c + 1]
-            chunk_size = hi - lo
-            if chunk_size <= 0:
+        for obs_idx in range(n_obs):
+            R = R_list[obs_idx]
+            if R == 0:
                 continue
-            start = jnp.asarray(lo, dtype=jnp.int32)
-            chunk_before = total
+            observer_host = observers_host[obs_idx]
+            observer_jax = jnp.asarray(observer_host, dtype=dtype)
+            replica_offsets = jnp.asarray(replicas_list[obs_idx], dtype=dtype) * boxsize
 
-            # Per-chunk staging across replicas (R typically 1-27): one
-            # contiguous HDF5 append per chunk keeps the per-chunk compress
-            # cost reasonable. Pending-1 ahead lets the next kernel dispatch
-            # overlap with the host gather, same trick as the streaming path.
-            stage_x, stage_v, stage_a = [], [], []
-            stage_rep, stage_shell, stage_lpid = [], [], []
-            pending = None
+            for c in range(n_part_chunks):
+                lo = chunk_starts[c]
+                hi = chunk_starts[c + 1]
+                chunk_size = hi - lo
+                if chunk_size <= 0:
+                    continue
+                start = jnp.asarray(lo, dtype=jnp.int32)
+                chunk_before = writer.total
 
-            def _drain_pending():
-                nonlocal pending
-                if pending is None:
-                    return
-                xp, vp, ap, mp, sp, rp = pending
-                mask_np = onp.asarray(mp)
-                if mask_np.any():
-                    sel = onp.where(mask_np)[0]
-                    stage_x.append(onp.asarray(xp)[sel, :].astype(onp.float32))
-                    vp_np = onp.asarray(vp)
-                    stage_v.append((vp_np[sel, :] if vp_np.ndim == 2 else vp_np[sel])
-                                   .astype(onp.float32))
-                    stage_a.append(onp.asarray(ap)[sel].astype(onp.float32))
-                    stage_rep.append(onp.full(sel.size, rp, dtype=onp.int16))
-                    stage_shell.append(onp.asarray(sp)[sel].astype(onp.int16))
-                    if keep_particle_idx:
-                        stage_lpid.append((sel + lo).astype(onp.int32))
+                # Per-chunk staging across replicas (R typically 1-27): one
+                # contiguous HDF5 append per chunk keeps the per-chunk compress
+                # cost reasonable. Pending-1 ahead lets the next kernel dispatch
+                # overlap with the host gather, same trick as the streaming path.
+                stage_x, stage_v, stage_a = [], [], []
+                stage_rep, stage_shell, stage_lpid = [], [], []
+                stage_def = {k: [] for k in def_keys}
                 pending = None
 
-            for r_idx in range(R):
-                r_off = replica_offsets[r_idx]
-                x, v, a_arr, mask, shell_idx = kernel(
-                    start, chunk_size, r_off, a_mid_d, a_far_d, a_near_d,
-                    observer_jax, a_shells_d, residual_tol_d,
-                    q_flat_d, psi_flats_d,
-                )
+                def _drain_pending():
+                    nonlocal pending
+                    if pending is None:
+                        return
+                    xp, vp, ap, mp, sp, extras_p, rp = pending
+                    mask_np = onp.asarray(mp)
+                    if mask_np.any():
+                        sel = onp.where(mask_np)[0]
+                        stage_x.append(onp.asarray(xp)[sel, :].astype(onp.float32))
+                        vp_np = onp.asarray(vp)
+                        stage_v.append((vp_np[sel, :] if vp_np.ndim == 2 else vp_np[sel])
+                                       .astype(onp.float32))
+                        stage_a.append(onp.asarray(ap)[sel].astype(onp.float32))
+                        stage_rep.append(onp.full(sel.size, rp, dtype=onp.int16))
+                        stage_shell.append(onp.asarray(sp)[sel].astype(onp.int16))
+                        if keep_particle_idx:
+                            stage_lpid.append((sel + lo).astype(onp.int32))
+                        for k, arr in zip(def_keys, extras_p):
+                            stage_def[k].append(onp.asarray(arr)[sel].astype(onp.float32))
+                    pending = None
+
+                for r_idx in range(R):
+                    r_off = replica_offsets[r_idx]
+                    res = kernel(
+                        start, chunk_size, r_off, a_mid_d, a_far_d, a_near_d,
+                        observer_jax, a_shells_d, residual_tol_d,
+                        q_flat_d, psi_flats_d, grad_psi_flats_d,
+                    )
+                    x, v, a_arr, mask, shell_idx = res[:5]
+                    extras = res[5:]
+                    _drain_pending()
+                    pending = (x, v, a_arr, mask, shell_idx, extras, r_idx)
                 _drain_pending()
-                pending = (x, v, a_arr, mask, shell_idx, r_idx)
-            _drain_pending()
 
-            # Concatenate this chunk's staging across replicas and flush.
-            if stage_x:
-                x_c = onp.concatenate(stage_x);     stage_x.clear()
-                v_c = onp.concatenate(stage_v);     stage_v.clear()
-                a_c = onp.concatenate(stage_a);     stage_a.clear()
-                rep_c = onp.concatenate(stage_rep); stage_rep.clear()
-                shell_c = onp.concatenate(stage_shell); stage_shell.clear()
-                lpid_c = onp.concatenate(stage_lpid) if stage_lpid else None
-                if stage_lpid:
-                    stage_lpid.clear()
-                _flush(x_c, v_c, a_c, rep_c, shell_c, lpid_c)
-                del x_c, v_c, a_c, rep_c, shell_c, lpid_c
+                # Concatenate this chunk's staging across replicas and flush.
+                if stage_x:
+                    x_c = onp.concatenate(stage_x);     stage_x.clear()
+                    v_c = onp.concatenate(stage_v);     stage_v.clear()
+                    a_c = onp.concatenate(stage_a);     stage_a.clear()
+                    rep_c = onp.concatenate(stage_rep); stage_rep.clear()
+                    shell_c = onp.concatenate(stage_shell); stage_shell.clear()
+                    lpid_c = onp.concatenate(stage_lpid) if stage_lpid else None
+                    if stage_lpid:
+                        stage_lpid.clear()
+                    extra_c = {k: onp.concatenate(stage_def[k]) for k in def_keys}
+                    for k in def_keys:
+                        stage_def[k].clear()
+                    if multi_obs:
+                        extra_c["ObserverIndex"] = onp.full(
+                            x_c.shape[0], obs_idx, dtype=onp.int16)
+                    writer.append(x=x_c, v=v_c, a=a_c, replica_idx=rep_c,
+                                  shell_idx=shell_c, particle_idx=lpid_c,
+                                  extra=(extra_c or None))
+                    if map_spec is not None:
+                        from .lightcone_maps import accumulate_shell_maps
+                        mw = (onp.full(x_c.shape[0], particle_mass, dtype=onp.float32)
+                              if map_spec.weighted else None)
+                        partial = onp.asarray(accumulate_shell_maps(
+                            x_c, a_c, observer_host, map_spec, mass_weight=mw),
+                            dtype=onp.float64)
+                        if multi_obs:
+                            maps_accum[obs_idx] += partial
+                        else:
+                            maps_accum += partial
+                    del x_c, v_c, a_c, rep_c, shell_c, lpid_c
 
-            if verbose:
-                print(f"  chunk {c+1}/{n_part_chunks} (particles {lo}-{hi}): "
-                      f"{total - chunk_before} new, {total} total", flush=True)
+                if verbose:
+                    print(f"  observer {obs_idx+1}/{n_obs} chunk {c+1}/"
+                          f"{n_part_chunks} (particles {lo}-{hi}): "
+                          f"{writer.total - chunk_before} new, {writer.total} total",
+                          flush=True)
 
-        # Gadget convention: NumPart_Total / NumPart_ThisFile are 32-bit per
-        # particle type; the upper 32 bits go to NumPart_Total_HighWord for
-        # catalogues with > 2^32 rows. Required for N >= 1024.
-        low = total & 0xFFFFFFFF
-        high = total >> 32
-        header.attrs["NumPart_ThisFile"] = [0, low, 0, 0, 0, 0]
-        header.attrs["NumPart_Total"] = [0, low, 0, 0, 0, 0]
-        header.attrs["NumPart_Total_HighWord"] = [0, high, 0, 0, 0, 0]
+        writer.close()
+        _write_maps(h5f)
+        total = writer.total
 
     if verbose:
         print(f"Lightcone written to {output_path} ({total} particles).",
               flush=True)
-    return {"n_particles": total, "n_replicas": R}
+    out = {"n_particles": total, "n_replicas": sum(R_list)}
+    if multi_obs:
+        out["n_observers"] = n_obs
+    if map_spec is not None:
+        out["maps"] = maps_accum
+    return out
 
 
 def evaluate_lpt_lightcone_streaming(dj, a_far: float, a_near: float = 1.0, n_shells: int = 64,

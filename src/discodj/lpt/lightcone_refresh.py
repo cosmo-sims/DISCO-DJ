@@ -36,6 +36,7 @@ import jax.numpy as jnp
 
 from ..core.io import compression_kwargs as _compression_kwargs
 from ..core.io import read_lightcone_header as _read_lightcone_header
+from ..core.io import LightconeHDF5Writer, lightcone_particle_mass
 from .lightcone import enumerate_replicas
 
 
@@ -643,80 +644,35 @@ def refresh_lightcone_cosmology(
     a_near_d = jnp.asarray(a_near, dtype=dtype)
     residual_tol_d = jnp.asarray(residual_tol, dtype=dtype)
 
-    # ---- Output file setup (mirrors evaluate_lpt_lightcone_to_hdf5_radial) ----
+    # ---- Output file setup (shared LightconeHDF5Writer) ----
     n_part_per_replica = int(res ** scene["dim"])
-    G = 43.007105731706317
-    Hubble = 100.0
-    particle_mass = float(
-        new_cosmology.Omega_m * 3.0 * Hubble * Hubble / (8.0 * onp.pi * G)
-        * boxsize ** 3 / n_part_per_replica
-    )
+    particle_mass = lightcone_particle_mass(new_cosmology.Omega_m, boxsize,
+                                            n_part_per_replica)
 
-    ds_kwargs = _compression_kwargs(compression)
-    prefix = "PartType1/"
+    header_attrs = {
+        "LightconeMode": 1,
+        "Observer": observer_host,
+        "BoxSize": boxsize,
+        "Omega0": float(new_cosmology.Omega_m),
+        "OmegaLambda": float(new_cosmology.Omega_de),
+        "HubbleParam": float(new_cosmology.h),
+        "MassTable": [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0],
+        "NumPart_PerReplica": n_part_per_replica,
+        "NumFilesPerSnapshot": 1,
+        "Time": 1.0,
+        "RefreshMode": mode,
+    }
 
     with h5py.File(output_lightcone, "w") as h5f, \
          h5py.File(input_lightcone, "r") as h5in:
-        header = h5f.create_group("Header")
-        header.attrs["LightconeMode"] = 1
-        header.attrs["Observer"] = observer_host
-        header.attrs["BoxSize"] = boxsize
-        header.attrs["Omega0"] = float(new_cosmology.Omega_m)
-        header.attrs["OmegaLambda"] = float(new_cosmology.Omega_de)
-        header.attrs["HubbleParam"] = float(new_cosmology.h)
-        header.attrs["MassTable"] = [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0]
-        header.attrs["NumPart_PerReplica"] = n_part_per_replica
-        header.attrs["NumFilesPerSnapshot"] = 1
-        header.attrs["Time"] = 1.0
-        header.attrs["RefreshMode"] = mode
-
-        def _mkds(name, shape_tail, dt):
-            shape = (0,) + shape_tail
-            maxshape = (None,) + shape_tail
-            chunks = (storage_chunk_rows,) + shape_tail
-            return h5f.create_dataset(prefix + name, shape=shape, maxshape=maxshape,
-                                      chunks=chunks, dtype=dt, **ds_kwargs)
-
-        d_coords = _mkds("Coordinates", (3,), onp.float32)
-        if v_is_radial:
-            d_vel = _mkds("RadialVelocity", (), onp.float32)
-        else:
-            d_vel = _mkds("Velocities", (3,), onp.float32)
-        d_a = _mkds("ScaleFactor", (), onp.float32)
-        d_pid = _mkds("ParticleIDs", (), onp.uint64)
-        d_mass = _mkds("Masses", (), onp.float32)
-        d_rep = _mkds("ReplicaIndex", (), onp.int16)
-        d_shell = _mkds("ShellIndex", (), onp.int16)
-        d_lpid = _mkds("LagrangianParticleIndex", (), onp.int32)
+        writer = LightconeHDF5Writer.open(
+            h5f, header_attrs=header_attrs, particle_mass=particle_mass,
+            v_is_radial=v_is_radial, keep_particle_idx=True,
+            compression=compression, storage_chunk_rows=storage_chunk_rows)
 
         in_lpid = h5in["PartType1/LagrangianParticleIndex"]
         in_rep = h5in["PartType1/ReplicaIndex"]
         in_a = h5in["PartType1/ScaleFactor"]
-
-        total_out = 0
-
-        def _flush(x, v, a_arr, rep, shell, lpid):
-            nonlocal total_out
-            n_new = x.shape[0]
-            if n_new == 0:
-                return
-            new_total = total_out + n_new
-            a_safe = onp.where(a_arr > 0, a_arr, 1.0)
-            if v_is_radial:
-                v_gadget = v * (100.0 / a_safe ** 1.5)
-                d_vel.resize((new_total,)); d_vel[total_out:new_total] = v_gadget
-            else:
-                v_gadget = v * (100.0 / a_safe[:, None] ** 1.5)
-                d_vel.resize((new_total, 3)); d_vel[total_out:new_total, :] = v_gadget
-            d_coords.resize((new_total, 3)); d_coords[total_out:new_total, :] = x
-            d_a.resize((new_total,)); d_a[total_out:new_total] = a_arr
-            d_rep.resize((new_total,)); d_rep[total_out:new_total] = rep
-            d_shell.resize((new_total,)); d_shell[total_out:new_total] = shell
-            d_pid.resize((new_total,))
-            d_pid[total_out:new_total] = onp.arange(total_out, new_total, dtype=onp.uint64)
-            d_mass.resize((new_total,)); d_mass[total_out:new_total] = particle_mass
-            d_lpid.resize((new_total,)); d_lpid[total_out:new_total] = lpid
-            total_out = new_total
 
         # ---- Main loop: batches of input rows ----
         for start in range(0, n_in, batch_size):
@@ -746,18 +702,15 @@ def refresh_lightcone_cosmology(
                 shell_c = onp.asarray(shell_new)[sel].astype(onp.int16)
                 rep_c = rep_batch[sel].astype(onp.int16)
                 lpid_c = pid_batch[sel].astype(onp.int32)
-                _flush(x_c, v_c, a_c, rep_c, shell_c, lpid_c)
+                writer.append(x=x_c, v=v_c, a=a_c, replica_idx=rep_c,
+                              shell_idx=shell_c, particle_idx=lpid_c)
             if verbose:
                 print(f"  batch {start//batch_size + 1} "
                       f"({start}-{end}): {int(valid_np.sum())} valid, "
-                      f"{total_out} total", flush=True)
+                      f"{writer.total} total", flush=True)
 
-        # ---- Finalize header (uint64 split into NumPart_Total + HighWord) ----
-        low = total_out & 0xFFFFFFFF
-        high = total_out >> 32
-        header.attrs["NumPart_ThisFile"] = [0, low, 0, 0, 0, 0]
-        header.attrs["NumPart_Total"] = [0, low, 0, 0, 0, 0]
-        header.attrs["NumPart_Total_HighWord"] = [0, high, 0, 0, 0, 0]
+        writer.close()
+        total_out = writer.total
 
     if verbose:
         print(f"Refresh done. Wrote {total_out} of {n_in} rows to "
@@ -788,43 +741,23 @@ def _write_empty_output(*, output_path, scene, new_cosmology,
     import h5py
     boxsize = scene["boxsize"]
     n_part_per_replica = int(scene["res"] ** scene["dim"])
-    G = 43.007105731706317
-    Hubble = 100.0
-    particle_mass = float(
-        new_cosmology.Omega_m * 3.0 * Hubble * Hubble / (8.0 * onp.pi * G)
-        * boxsize ** 3 / n_part_per_replica
-    )
-    ds_kwargs = _compression_kwargs(compression)
+    particle_mass = lightcone_particle_mass(new_cosmology.Omega_m, boxsize,
+                                            n_part_per_replica)
+    header_attrs = {
+        "LightconeMode": 1,
+        "Observer": observer_host,
+        "BoxSize": boxsize,
+        "Omega0": float(new_cosmology.Omega_m),
+        "OmegaLambda": float(new_cosmology.Omega_de),
+        "HubbleParam": float(new_cosmology.h),
+        "MassTable": [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0],
+        "NumPart_PerReplica": n_part_per_replica,
+        "NumFilesPerSnapshot": 1,
+        "Time": 1.0,
+    }
     with h5py.File(output_path, "w") as f:
-        h = f.create_group("Header")
-        h.attrs["LightconeMode"] = 1
-        h.attrs["Observer"] = observer_host
-        h.attrs["BoxSize"] = boxsize
-        h.attrs["Omega0"] = float(new_cosmology.Omega_m)
-        h.attrs["OmegaLambda"] = float(new_cosmology.Omega_de)
-        h.attrs["HubbleParam"] = float(new_cosmology.h)
-        h.attrs["MassTable"] = [0.0, particle_mass, 0.0, 0.0, 0.0, 0.0]
-        h.attrs["NumPart_PerReplica"] = n_part_per_replica
-        h.attrs["NumFilesPerSnapshot"] = 1
-        h.attrs["Time"] = 1.0
-        h.attrs["NumPart_ThisFile"] = [0, 0, 0, 0, 0, 0]
-        h.attrs["NumPart_Total"] = [0, 0, 0, 0, 0, 0]
-        h.attrs["NumPart_Total_HighWord"] = [0, 0, 0, 0, 0, 0]
-        g = f.create_group("PartType1")
-        def _mkds(name, shape_tail, dt):
-            chunks = (storage_chunk_rows,) + shape_tail
-            g.create_dataset(name, shape=(0,) + shape_tail,
-                             maxshape=(None,) + shape_tail,
-                             chunks=chunks, dtype=dt, **ds_kwargs)
-        _mkds("Coordinates", (3,), onp.float32)
-        if v_is_radial:
-            _mkds("RadialVelocity", (), onp.float32)
-        else:
-            _mkds("Velocities", (3,), onp.float32)
-        _mkds("ScaleFactor", (), onp.float32)
-        _mkds("ParticleIDs", (), onp.uint64)
-        _mkds("Masses", (), onp.float32)
-        _mkds("ReplicaIndex", (), onp.int16)
-        _mkds("ShellIndex", (), onp.int16)
-        if keep_particle_idx:
-            _mkds("LagrangianParticleIndex", (), onp.int32)
+        writer = LightconeHDF5Writer.open(
+            f, header_attrs=header_attrs, particle_mass=particle_mass,
+            v_is_radial=v_is_radial, keep_particle_idx=keep_particle_idx,
+            compression=compression, storage_chunk_rows=storage_chunk_rows)
+        writer.close()
