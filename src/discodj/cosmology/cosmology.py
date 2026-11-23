@@ -5,13 +5,16 @@ from ..core.utils import rk4_integrate
 
 __all__ = ["Cosmology"]
 
+def _safe_pow(a: AnyArray | float, p: AnyArray | float | int) -> jax.Array:
+    a = jnp.asarray(a)
+    return jnp.where(a > 0, a ** p, 0.0)
 
 @jax.tree_util.register_pytree_node_class
 class Cosmology:
     __slots__ = [
         "_dtype_num", "_dtype",
         "_Omega_c", "_Omega_b", "_h", "_sigma8", "_n_s", "_Omega_k", "_w0", "_wa",
-        "_requires_jacfwd", "_timetables", "is_derivative"
+        "_requires_jacfwd", "_timetables", "is_derivative", "_Omega_r"
     ]
     def __init__(
             self,
@@ -23,6 +26,7 @@ class Cosmology:
             Omega_k: float | AnyArray = 0.0,
             w0: float | AnyArray = -1.0,
             wa: float | AnyArray = 0.0,
+            Omega_r: float | AnyArray = 0.0,
             timetable_settings: dict | None = None,
             dtype_num: int = 32,            
             requires_jacfwd: bool = False,
@@ -35,6 +39,7 @@ class Cosmology:
         :param h: Dimensionless Hubble parameter (H_0 / 100 km/s/Mpc).
         :param sigma8: RMS mass fluctuation in spheres of 8 Mpc/h.
         :param n_s: Scalar spectral index.
+        :param Omega_r: Radiation density parameter. Default is 0.0.
         :param Omega_k: Curvature density parameter. Default is 0.0.
         :param w0: Dark energy equation of state parameter at z=0. Default is -1.0.
         :param wa: Evolution of the dark energy equation of state. Default is 0.0.
@@ -45,8 +50,8 @@ class Cosmology:
         """
         self._dtype_num = dtype_num
         self._dtype = jnp.float32 if dtype_num == 32 else jnp.float64
-        parameter_keys = ("Omega_c", "Omega_b", "h", "sigma8", "n_s", "Omega_k", "w0", "wa")
-        parameters = (Omega_c, Omega_b, h, sigma8, n_s, Omega_k, w0, wa)
+        parameter_keys = ("Omega_c", "Omega_b", "h", "sigma8", "n_s", "Omega_k", "w0", "wa", "Omega_r")
+        parameters = (Omega_c, Omega_b, h, sigma8, n_s, Omega_k, w0, wa, Omega_r)
         for k, param in zip(parameter_keys, parameters):
             setattr(self, f"_{k}", param)
 
@@ -72,7 +77,7 @@ class Cosmology:
         :return: A new Cosmology instance with computed timetables.
         """
         # Set timetable setting defaults
-        a_min = 1e-10
+        a_min = 1e-6
         steps_default = 2500
         s = {"a_min": a_min, "spacing_power": 0.0, "steps": steps_default, "a_max": 1.0}
 
@@ -109,7 +114,7 @@ class Cosmology:
             f"Cosmology(Omega_c={self._Omega_c}, Omega_b={self._Omega_b}, h={self._h}, "
             f"sigma8={self._sigma8}, n_s={self._n_s}, Omega_k={self._Omega_k}, w0={self._w0}, wa={self._wa}, "
             f"dtype_num={self._dtype_num}, requires_jacfwd={self._requires_jacfwd}, "
-            f"is_derivative={self.is_derivative})"
+            f"is_derivative={self.is_derivative}), Omega_r={self._Omega_r}"
         )
 
     def __str__(self):
@@ -131,6 +136,7 @@ class Cosmology:
                 f"  n_s: {format_str.format(self._n_s)} \n"
                 f"  sigma8: {format_str.format(self._sigma8)} \n"
                 f"  Omega_k: {format_str.format(self._Omega_k)} \n"
+                f"  Omega_r: {format_str.format(self.Omega_r)} \n"
                 f"  w0: {format_str.format(self._w0)} \n"
                 f"  wa: {format_str.format(self._wa)}"
             )
@@ -158,6 +164,11 @@ class Cosmology:
     def Omega_m(self):
         """Total matter density parameter."""
         return self._Omega_c + self._Omega_b
+    
+    @property
+    def Omega_r(self):
+        """Radiation density parameter."""
+        return self._Omega_r
 
     @property
     def h(self):
@@ -193,7 +204,7 @@ class Cosmology:
     @forbidden_for_derivative
     def Omega_de(self):
         """Compute the dark energy density parameter."""
-        return 1.0 - self._Omega_c - self._Omega_b - self._Omega_k
+        return 1.0 - self._Omega_c - self._Omega_b - self._Omega_k - self.Omega_r
 
     @property
     @forbidden_for_derivative
@@ -223,6 +234,7 @@ class Cosmology:
             self.Omega_k,
             self.w0,
             self.wa,
+            self.Omega_r
         )
         aux_data = {
             "dtype_num": self._dtype_num,
@@ -241,7 +253,7 @@ class Cosmology:
         :param children: Flattened child attributes.
         :return: Reconstructed `Cosmology` instance.
         """
-        num_params = 8  # Number of cosmological parameters
+        num_params = 9  # Number of cosmological parameters
         # is_derivative = all(isinstance(c, jax.interpreters.ad.JVPTracer) for c in children) or aux_data["is_derivative"]
         cosmological_params = children[:num_params]
         instance = cls(
@@ -253,6 +265,7 @@ class Cosmology:
             Omega_k=cosmological_params[5],
             w0=cosmological_params[6],
             wa=cosmological_params[7],
+            Omega_r = cosmological_params[8],
             dtype_num=aux_data["dtype_num"],
             requires_jacfwd=aux_data["requires_jacfwd"],
             is_derivative=aux_data["is_derivative"]
@@ -298,27 +311,33 @@ class Cosmology:
     def E(self, a: float | AnyArray) -> AnyArray:
         """Dimensionless Hubble parameter as a function of scale factor."""
         # see https://arxiv.org/pdf/astro-ph/0508156 (Eqs. 3 & 5) for w(a) = w0 + wa (1-a)
-        return jnp.sqrt(self.Omega_m * a ** -3 + self.Omega_k * a ** -2 + self.Omega_de_of_a(a))
+        return jnp.sqrt(
+            self.Omega_m * _safe_pow(a, -3) + self.Omega_k * _safe_pow(a, -2) + self.Omega_r * _safe_pow(a, -4)
+            + self.Omega_de_of_a(a))
 
     @forbidden_for_derivative
     def Eda(self, a: AnyArray) -> AnyArray:
         """Compute the derivative of the dimensionless Hubble parameter E(a) with respect to a.
         """
         # Matter term
-        matter_term = self.Omega_m * a ** -3
-        dmatter_da = -3 * self.Omega_m * a ** -4
+        matter_term = self.Omega_m * _safe_pow(a, -3)
+        dmatter_da = -3 * self.Omega_m * _safe_pow(a, -4)
 
         # Curvature term
-        curvature_term = self.Omega_k * a ** -2
-        dcurvature_da = -2 * self.Omega_k * a ** -3
+        curvature_term = self.Omega_k * _safe_pow(a, -2)
+        dcurvature_da = -2 * self.Omega_k * _safe_pow(a, -3)
 
         # Dark energy term
         de_term = self.Omega_de_of_a(a)
-        dde_da = self.Omega_de * (3 * a ** (-4 - 3 * self.w0 - 3 * self.wa)
+        dde_da = self.Omega_de * (3 * _safe_pow(a, -4 - 3 * self.w0 - 3 * self.wa)
                                   * jnp.exp(-3 * self.wa * (1 - a)) * (-1 - self.w0 + (a - 1) * self.wa))
 
-        dE2_da = dmatter_da + dcurvature_da + dde_da
-        E = jnp.sqrt(matter_term + curvature_term + de_term)
+        # Radiation term
+        radiation_term = self.Omega_r * _safe_pow(a, -4)
+        dradiation_da = -4 * self.Omega_r * _safe_pow(a, -5)
+
+        dE2_da = dmatter_da + dcurvature_da + dde_da + dradiation_da
+        E = jnp.sqrt(matter_term + curvature_term + de_term + radiation_term)
         return 0.5 * dE2_da / E
 
     @forbidden_for_derivative
@@ -344,21 +363,39 @@ class Cosmology:
         else:
             eps = jnp.finfo(jnp.float32).eps
 
+        a_integration = a[1:]
+        a_safe = jnp.maximum(a_integration, eps)
+        ln_a_safe = jnp.log(a_safe)
+
+        a_ini = a_min_integration
+        Om0 = jnp.asarray(self.Omega_m, dtype=a.dtype)
+        Or0 = jnp.asarray(self.Omega_r, dtype=a.dtype)
+        ratio_r_m = Or0 / jnp.maximum(Om0, eps)
+        C_rad = (2.0 / 3.0) * ratio_r_m
+        C_false = jnp.asarray(0.0, dtype=a.dtype)
+
         ln_a = jnp.log(a)
 
-        y1_0 = jnp.log(a_min_integration)  # D1 ~ a
-        f1_0 = 1.0
-        D2_0 = -3.0 / 7.0 * a_min_integration ** 2  # D2 ~ -3/7 a^2
+        # D1_0 = a_ini + C_false
+        D1_0 = a_ini + C_rad
+        y1_0 = jnp.log(D1_0)  # D1 ~ a
+        f1_0 = a_ini / D1_0
+
+        D2_0 = -3.0 / 7.0 * D1_0 ** 2  # D2 ~ -3/7 a^2
         y2_0 = jnp.log(jnp.abs(D2_0))
-        f2_0 = 2.0
-        D3a_0 = 1.0 / 3.0 * a_min_integration ** 3  # D3a ~ +1/3 a^3
+        f2_0 = 2.0 * f1_0
+
+        D3a_0 = 1.0 / 3.0 * D1_0 ** 3  # D3a ~ +1/3 a^3
         y3a_0 = jnp.log(jnp.abs(D3a_0))
-        f3a_0 = 3.0
-        D3b_0 = -10.0 / 21.0 * a_min_integration ** 3  # D3b ~ -10/21 a^3
+        f3a_0 = 3.0 * f1_0
+
+        D3b_0 = -10.0 / 21.0 * D1_0 ** 3  # D3b ~ -10/21 a^3
         y3b_0 = jnp.log(jnp.abs(D3b_0))
-        f3b_0 = 3.0
-        D3c_0 = 1.0 / 7.0 * a_min_integration ** 3  # D3c ~ +1/7 a^3
-        y3c_0 = jnp.log(jnp.abs(D3c_0))
+        f3b_0 = 3.0 * f1_0
+
+        D3c_0 = 1.0 / 7.0 * D1_0 ** 3  # D3c ~ +1/7 a^3
+        y3c_0 = jnp.log(jnp.maximum(jnp.abs(D3c_0), eps))
+
         y0_log = jnp.array([y1_0, f1_0, y2_0, f2_0, y3a_0, f3a_0, y3b_0, f3b_0, y3c_0])
 
         # Signs from EdS expressions at small a
@@ -376,17 +413,19 @@ class Cosmology:
             Esqr = self.E(a_loc) ** 2
             Om_a = (self.Omega_m * a_loc ** -3) / Esqr
             Ox_a = self.Omega_de_of_a(a_loc) / Esqr
+            Or_a = (self.Omega_r * _safe_pow(a_loc, -4)) / Esqr
             w_a = self.w(a_loc)
 
             # Unpack
             (y1, f1, y2, f2, y3a, f3a, y3b, f3b, y3c) = y
 
             # Drag coefficient
-            drag = (1.0 - 0.5 * (Om_a + (1.0 + 3.0 * w_a) * Ox_a))
+            drag = (1.0 - 0.5 * (Om_a + 2.0 * Or_a + (1.0 + 3.0 * w_a) * Ox_a))
 
             # D1
             dy1 = f1
             df1 = 1.5 * Om_a - f1 ** 2 - f1 * drag
+
             D1 = jnp.exp(y1)
             D1_sq = D1 ** 2
             D1_cu = D1 ** 3
@@ -411,7 +450,7 @@ class Cosmology:
             dy3c = D1 * D2 / D3c * (f1 - f2)
             return jnp.array([dy1, df1, dy2, df2, dy3a, df3a, dy3b, df3b, dy3c])
 
-        ys_log = rk4_integrate(jax.jit(growth_derivs_log_signed), y0_log, ln_a)
+        ys_log = rk4_integrate(jax.jit(growth_derivs_log_signed), y0_log, ln_a_safe)
         (y1, f1, y2, f2, y3a, f3a, y3b, f3b, y3c) = ys_log.T
         D1 = jnp.exp(y1)
         D2 = s2 * jnp.exp(y2)
@@ -419,31 +458,55 @@ class Cosmology:
         D3b = s3b * jnp.exp(y3b)
         D3c = s3c * jnp.exp(y3c)
 
-        D1p = f1 * D1 / a
-        D2p = f2 * D2 / a
-        D3ap = f3a * D3a / a
-        D3bp = f3b * D3b / a
+        D1p = f1 * D1 * _safe_pow(a_safe, -1)
+        D2p = f2 * D2 * _safe_pow(a_safe, -1)
+        D3ap = f3a * D3a * _safe_pow(a_safe, -1)
+        D3bp = f3b * D3b * _safe_pow(a_safe, -1)
 
         ys = jnp.stack([D1, D1p, D2, D2p, D3a, D3ap, D3b, D3bp, D3c], axis=-1)
-        gradients_log = jax.vmap(growth_derivs_log_signed)(a, ys)
-        gradients = gradients_log * ys / a[:, None]  # Convert to linear derivatives
+
+        gradients_log = jax.vmap(growth_derivs_log_signed)(ln_a_safe, ys_log)
+        # gradients = gradients_log * ys / a[:, None]  # Convert to linear derivatives
 
         # Normalize and build a dictionary
-        Dplus_unnormed_at_1 = jnp.interp(1.0, a, ys[:, 0])
-        names = ("Dplus", "Dplusda", "D2plus", "D2plusda", "D3plusa", "D3plusada", "D3plusb", "D3plusbda", "D3plusc")
+        Dplus_unnormed_at_1 = jnp.interp(1.0, a_integration, ys[:, 0])
+
+        names = ("Dplus", "Dplusda", "D2plus", "D2plusda", "D3plusa", "D3plusada", "D3plusb", "D3plusbda",
+                 "D3plusc")
         norm_exponent = (1, 1, 2, 2, 3, 3, 3, 3, 3)
         growth_dict = {name: ys[:, i] / Dplus_unnormed_at_1 ** norm_exponent[i] for i, name in enumerate(names)}
         growth_dict["Dplus_unnormed_at_1"] = Dplus_unnormed_at_1
 
         # Append the second derivative of Dplus
-        Dplusdada = gradients[:, 1]
+        df1_dln_a = gradients_log[:, 1]
+        Dplusdada = D1 * _safe_pow(a_safe, -2) * (df1_dln_a + f1 ** 2 - f1)
         growth_dict["Dplusdada"] = Dplusdada / Dplus_unnormed_at_1
 
         # Also append the derivative of the transversal 3rd order term
         D3plusc_da_unnormed = D2 * D1p - D1 * D2p
         growth_dict["D3pluscda"] = D3plusc_da_unnormed / Dplus_unnormed_at_1 ** 3
+        # Prepend the a == 0 row with exact EdS limits (keep integration starting at a_min)
+        Dplus_1 = Dplus_unnormed_at_1
+        C_rad_norm = C_rad / Dplus_1
+        prepend_vals = {
+            "Dplus": C_rad_norm,
+            "Dplusda": 1.0 / Dplus_1,
+            "Dplusdada": 0.0,
+            "D2plus": (-3.0 / 7.0) * C_rad_norm ** 2,
+            "D2plusda": (-6.0 / 7.0) * C_rad / Dplus_1 ** 2,
+            "D3plusa": (1.0 / 3.0) * C_rad_norm ** 3,
+            "D3plusada": C_rad ** 2 / Dplus_1 ** 3,
+            "D3plusb": (-10.0 / 21.0) * C_rad_norm ** 3,
+            "D3plusbda": (-10.0 / 7.0) * C_rad ** 2 / Dplus_1 ** 3,
+            "D3plusc": (1.0 / 7.0) * C_rad_norm ** 3,
+            "D3pluscda": (3.0 / 7.0) * C_rad ** 2 / Dplus_1 ** 3,
+        }
+        for key, val in prepend_vals.items():
+            growth_dict[key] = jnp.concatenate(
+                (jnp.array([val], dtype=growth_dict[key].dtype), growth_dict[key])
+            )
 
-        # Convert to 32-bit precision if necessary
+        # Final dtype cast
         growth_dict = {key: val.astype(self._dtype) for key, val in growth_dict.items()}
 
         return growth_dict

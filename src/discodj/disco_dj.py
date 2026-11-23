@@ -1102,7 +1102,7 @@ class DiscoDJ:
         if use_diffrax:
             raise NotImplementedError("Diffrax support is currently disabled, as the structure of the Diffrax solvers"
                                       "has changed. Support might be added again at a later stage. For now, please "
-                                      "set use_diffax = False.")
+                                      "set use_diffrax = False.")
 
             # Set up the time settings for Diffrax
             t_save = jnp.arange(n_steps + 1) if collect_all else jnp.array([n_steps])
