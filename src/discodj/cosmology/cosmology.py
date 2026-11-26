@@ -100,6 +100,7 @@ class Cosmology:
             exponent = s["spacing_power"]
             a_table = jnp.linspace(s["a_min"] ** exponent, s["a_max"] ** exponent, s["steps"],
                                    dtype=self._dtype) ** (1 / exponent)
+        a_table = jnp.concatenate((jnp.array([0.0], dtype=self._dtype), a_table), axis=0)
 
         growth_dict = self.compute_unnormed_growth(a_table, a_min_integration=s["a_min"])
         superconft_table = self.compute_superconft(a_table)
@@ -372,16 +373,20 @@ class Cosmology:
         Or0 = jnp.asarray(self.Omega_r, dtype=a.dtype)
         ratio_r_m = Or0 / jnp.maximum(Om0, eps)
         C_rad = (2.0 / 3.0) * ratio_r_m
-        C_false = jnp.asarray(0.0, dtype=a.dtype)
-
-        ln_a = jnp.log(a)
+        # C_false = jnp.asarray(0.0, dtype=a.dtype)
 
         # D1_0 = a_ini + C_false
         D1_0 = a_ini + C_rad
-        y1_0 = jnp.log(D1_0)  # D1 ~ a
+        y1_0 = jnp.log(D1_0)  # D1 ~ a # For rad D1 ~ 2/3fr0 + a
         f1_0 = a_ini / D1_0
 
-        D2_0 = -3.0 / 7.0 * D1_0 ** 2  # D2 ~ -3/7 a^2
+        if Or0 > 0.0:
+            D2_0 = - C_rad**2 - 2*C_rad * a_ini - 1 / 2 * a_ini**2 # D2 ~ - 2/3 * fr0^2 - 4/3fr0 * a - 1/2 a^2
+        elif Or0 == 0.0:
+            D2_0 = -3.0 / 7.0 * D1_0 ** 2 # D2 ~ -3/7 a^2 
+        else:
+            raise ValueError("Please use Omega_r >= 0")
+        
         y2_0 = jnp.log(jnp.abs(D2_0))
         f2_0 = 2.0 * f1_0
 
@@ -399,7 +404,7 @@ class Cosmology:
         y0_log = jnp.array([y1_0, f1_0, y2_0, f2_0, y3a_0, f3a_0, y3b_0, f3b_0, y3c_0])
 
         # Signs from EdS expressions at small a
-        s2 = jnp.sign(-3.0 / 7.0)  # D2 ~ -3/7 a^2
+        s2 = jnp.sign(-3.0 / 7.0)  # D2 ~ -3/7 a^2 # sign for rad doesn't change
         s3a = jnp.sign(1.0 / 3.0)  # D3a ~ +1/3 a^3
         s3b = jnp.sign(-10.0 / 21.0)  # D3b ~ -10/21 a^3
         s3c = jnp.sign(1.0 / 7.0)  # D3c ~ +1/7 a^3
@@ -488,12 +493,24 @@ class Cosmology:
         # Prepend the a == 0 row with exact EdS limits (keep integration starting at a_min)
         Dplus_1 = Dplus_unnormed_at_1
         C_rad_norm = C_rad / Dplus_1
+
+        if Or0 == 0.0:
+            Dplus_norm =  C_rad / Dplus_1
+            D2plus_norm = (-3.0 / 7.0) * C_rad**2 / Dplus_1**2
+            D2plus_da_norm = (-6.0 / 7.0) * C_rad / Dplus_1**2
+        elif Or0 > 0.0:
+            Dplus_norm = C_rad / Dplus_1
+            D2plus_norm = jnp.asarray((-1.0) * C_rad_norm ** 2, dtype=a.dtype)
+            D2plus_da_norm = -2.0 * C_rad / Dplus_1 ** 2
+        else:
+            raise ValueError("Please use Omega_r >= 0")
+
         prepend_vals = {
-            "Dplus": C_rad_norm,
+            "Dplus": Dplus_norm,
             "Dplusda": 1.0 / Dplus_1,
             "Dplusdada": 0.0,
-            "D2plus": (-3.0 / 7.0) * C_rad_norm ** 2,
-            "D2plusda": (-6.0 / 7.0) * C_rad / Dplus_1 ** 2,
+            "D2plus": D2plus_norm,
+            "D2plusda": D2plus_da_norm,
             "D3plusa": (1.0 / 3.0) * C_rad_norm ** 3,
             "D3plusada": C_rad ** 2 / Dplus_1 ** 3,
             "D3plusb": (-10.0 / 21.0) * C_rad_norm ** 3,
@@ -569,6 +586,11 @@ class Cosmology:
     def Dplus(self, a: float | AnyArray) -> AnyArray:
         """Growth factor as a function of scale factor."""
         return self.get_interpolated_property(a, "a", "Dplus")
+
+    @forbidden_for_derivative
+    def D2plus(self, a: float | AnyArray) -> AnyArray:
+        """2nd order Growth factor as a function of scale factor."""
+        return self.get_interpolated_property(a, "a", "D2plus")
 
     @forbidden_for_derivative
     def Dplusda(self, a: float | AnyArray) -> AnyArray:
